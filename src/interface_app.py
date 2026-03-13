@@ -7,14 +7,14 @@ import numpy as np
 import win32gui
 import win32con
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QGridLayout,
-                             QWidget, QLabel, QTabWidget, QVBoxLayout)
+                             QWidget, QLabel, QTabWidget, QVBoxLayout, QHBoxLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtGui import QFont, QColor
 import pyqtgraph as pg
 from dotenv import load_dotenv
 
 
-# --- МОДУЛЬ СЕТИ (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- МОДУЛЬ СЕТИ ---
 class UDPBridge(QThread):
     angles_received = pyqtSignal(list)
     gps_received = pyqtSignal(list)
@@ -51,173 +51,127 @@ class UDPBridge(QThread):
                 continue
 
 
-# --- ОСНОВНОЕ ПРИЛОЖЕНИЕ (РАСШИРЕННОЕ) ---
+# --- ОСНОВНОЕ ПРИЛОЖЕНИЕ ---
 class FlightControlApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FCS - Advanced Telemetry Monitor")
-        self.resize(1600, 950)  # Немного увеличим для вкладок
-        self.max_points = 200  # Больше точек для плавности
+        self.setWindowTitle("FCS - 6DOF Telemetry System")
+        self.resize(1600, 900)
 
-        # Данные
-        self.buffer = {'r': np.zeros(self.max_points), 'p': np.zeros(self.max_points), 'y': np.zeros(self.max_points)}
-        self.x_axis = np.arange(self.max_points)  # Ось X для графиков
+        # Настройка темы через статический метод (исправление ошибки NameError: app)
+        if QApplication.instance():
+            QApplication.instance().setPalette(QApplication.style().standardPalette())
 
-        # --- 1. КРАСИВЫЙ ЦВЕТОВОЙ ИНТЕРФЕЙС (CSS) ---
-        # Задаем общую темную тему
-        app.setPalette(QApplication.style().standardPalette())
         self.setStyleSheet("""
-            QMainWindow { background-color: #1a1a1a; color: #f0f0f0; }
-            QLabel { color: #f0f0f0; font-family: 'Segoe UI'; }
-            QTabWidget::pane { border: 1px solid #333; background-color: #1a1a1a; }
-            QTabBar::tab { background: #2d2d2d; color: #b0b0b0; padding: 10px 20px; border: 1px solid #333; border-bottom: none; }
-            QTabBar::tab:selected { background: #3d3d3d; color: #ffffff; border-color: #555; }
-            QTabBar::tab:hover { background: #353535; }
+            QMainWindow { background-color: #121212; }
+            QTabWidget::pane { border: 1px solid #333; top: -1px; background: #121212; }
+            QTabBar::tab { 
+                background: #1e1e1e; color: #888; padding: 12px 30px; 
+                border: 1px solid #333; border-bottom: none; font-weight: bold;
+            }
+            QTabBar::tab:selected { background: #2d2d2d; color: #fff; border-bottom: 2px solid #0078d7; }
+            QLabel { color: #eee; }
         """)
 
+        self.max_points = 150
+        self.buffer = {'r': np.zeros(self.max_points), 'p': np.zeros(self.max_points), 'y': np.zeros(self.max_points)}
+        self.unity_hwnd = None
+
+        # Центральный виджет и главный горизонтальный Layout
         central_widget = QWidget()
-        self.main_layout = QGridLayout(central_widget)
         self.setCentralWidget(central_widget)
+        self.main_layout = QHBoxLayout(central_widget)
 
-        # --- 2. ДОБАВЛЕНИЕ ВКЛАДОК (Рисунок 2) ---
+        # Левая часть: Вкладки
         self.tabs = QTabWidget()
-        # Добавляем вкладку "Real-Time Data"
-        self.telemetry_tab = QWidget()
-        self.telemetry_layout = QGridLayout(self.telemetry_tab)
+        self.main_layout.addWidget(self.tabs, stretch=1)
 
-        # Добавляем вкладки-заглушки "Mission" и "Analyze"
+        # --- ВКЛАДКА REAL-TIME DATA ---
+        self.rt_widget = QWidget()
+        self.rt_layout = QVBoxLayout(self.rt_widget)
+
+        # Индикаторы (Верхний ряд)
+        ind_row = QHBoxLayout()
+        self.ind_lat = self.create_indicator("LATITUDE", "#FF4444")
+        self.ind_lon = self.create_indicator("LONGITUDE", "#44FF44")
+        self.ind_alt = self.create_indicator("ALTITUDE", "#4444FF")
+        ind_row.addWidget(self.ind_lat);
+        ind_row.addWidget(self.ind_lon);
+        ind_row.addWidget(self.ind_alt)
+        self.rt_layout.addLayout(ind_row)
+
+        # Графики (Стилизация под рисунок 1)
+        pg.setConfigOption('background', '#121212')
+        pg.setConfigOption('foreground', '#888')
+        self.pw_r, self.curve_r = self.create_plot("ACCELERATION ROLL", '#FF4444')
+        self.pw_p, self.curve_p = self.create_plot("ACCELERATION PITCH", '#44FF44')
+        self.pw_y, self.curve_y = self.create_plot("ACCELERATION YAW", '#4444FF')
+        self.rt_layout.addWidget(self.pw_r);
+        self.rt_layout.addWidget(self.pw_p);
+        self.rt_layout.addWidget(self.pw_y)
+
+        # Наполнение вкладок (Рисунок 2)
         self.tabs.addTab(QWidget(), "Mission")
-        self.tabs.addTab(self.telemetry_tab, "Real-Time Data")
+        self.tabs.addTab(self.rt_widget, "Real-Time Data")
         self.tabs.addTab(QWidget(), "Analyze")
+        self.tabs.setCurrentIndex(1)  # По умолчанию открываем Data
 
-        # Основной лейаут теперь содержит вкладки и Unity
-        # Вкладки слева
-        self.main_layout.addWidget(self.tabs, 0, 0, 1, 1)
-
-        # --- 3. ИНДИКАТОРЫ (Внутри вкладки) ---
-        # Создаем контейнер для индикаторов
-        indicators_container = QWidget()
-        indicators_layout = QGridLayout(indicators_container)
-
-        self.ind_lat = self.create_indicator("ШИРОТА (LAT)", "#FF4444")
-        self.ind_lon = self.create_indicator("ДОЛГОТА (LON)", "#44FF44")
-        self.ind_alt = self.create_indicator("ВЫСОТА (ALT)", "#4444FF")
-
-        indicators_layout.addWidget(self.ind_lat, 0, 0);
-        indicators_layout.addWidget(self.ind_lon, 0, 1);
-        indicators_layout.addWidget(self.ind_alt, 0, 2)
-
-        # Размещаем индикаторы внутри вкладки сверху
-        self.telemetry_layout.addWidget(indicators_container, 0, 0, 1, 3)
-
-        # --- 4. КРАСИВЫЕ ГРАФИКИ (Внутри вкладки, Рисунок 1) ---
-        # Настройка глобальных стилей pyqtgraph
-        pg.setConfigOption('background', '#1a1a1a')  # Фон как у окна
-        pg.setConfigOption('foreground', '#d0d0d0')  # Цвет осей и текста
-
-        # Создаем графики с улучшенными стилями
-        self.pw_r, self.curve_r = self.create_plot("ROLL ANGLE", '#FF4444')
-        self.pw_p, self.curve_p = self.create_plot("PITCH ANGLE", '#44FF44')
-        self.pw_y, self.curve_y = self.create_plot("YAW ANGLE", '#4444FF')
-
-        # Размещаем графики внутри вкладки под индикаторами
-        self.telemetry_layout.addWidget(self.pw_r, 1, 0);
-        self.telemetry_layout.addWidget(self.pw_p, 2, 0);
-        self.telemetry_layout.addWidget(self.pw_y, 3, 0)
-
-        # Растягиваем графики
-        self.telemetry_layout.setRowStretch(1, 1);
-        self.telemetry_layout.setRowStretch(2, 1);
-        self.telemetry_layout.setRowStretch(3, 1)
-        self.telemetry_layout.setColumnStretch(0, 1)
-
-        # --- 5. UNITY КОНТЕЙНЕР (Справа) ---
+        # Правая часть: Контейнер Unity
         self.exe_container = QWidget()
-        self.exe_container.setMinimumWidth(800)
-        self.exe_container.setStyleSheet("background-color: black; border: 2px solid #3d3d3d; border-radius: 5px;")
-        # Размещаем Unity контейнер справа от вкладок
-        self.main_layout.addWidget(self.exe_container, 0, 1, 1, 2)
+        self.exe_container.setMinimumWidth(700)
+        self.exe_container.setStyleSheet("background-color: #000; border: 2px solid #333; border-radius: 4px;")
+        self.main_layout.addWidget(self.exe_container, stretch=2)
 
-        # Соотношение ширины вкладок и Unity
-        self.main_layout.setColumnStretch(0, 1)
-        self.main_layout.setColumnStretch(1, 2)
-
-        # Потоки (без изменений)
+        # Сигналы и потоки
         self.udp_thread = UDPBridge()
         self.udp_thread.angles_received.connect(self.update_graphs)
         self.udp_thread.gps_received.connect(self.update_labels)
         self.udp_thread.start()
 
-        self.unity_hwnd = None
+        # Событие переключения вкладок
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
         QTimer.singleShot(2000, self.launch_exe)
 
-    # --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (УЛУЧШЕННЫЕ) ---
     def create_indicator(self, label_text, color):
-        container = QWidget();
-        l_layout = QGridLayout(container)
-
-        # Красивый шрифт для заголовка
-        label_lbl = QLabel(label_text);
-        label_lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        label_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # Красивый шрифт для значения
-        val_lbl = QLabel("0.000000");
-        val_lbl.setFont(QFont("Consolas", 22, QFont.Weight.Bold))
-
-        # Стилизация индикатора: тень, отступы, фон
-        val_lbl.setStyleSheet(f"""
-            color: {color}; 
-            background-color: #2d2d2d; 
-            padding: 15px; 
-            border-radius: 8px; 
-            border: 1px solid #3d3d3d;
-        """)
-        val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        l_layout.addWidget(label_lbl, 0, 0)
-        l_layout.addWidget(val_lbl, 1, 0)
-        l_layout.setContentsMargins(5, 5, 5, 5)  # Отступы внутри
-
-        container.value_label = val_lbl
+        container = QWidget()
+        vbox = QVBoxLayout(container)
+        lbl = QLabel(label_text);
+        lbl.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        val = QLabel("0.000000");
+        val.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
+        val.setStyleSheet(
+            f"color: {color}; background: #1e1e1e; padding: 10px; border-radius: 5px; border: 1px solid #333;")
+        val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vbox.addWidget(lbl);
+        vbox.addWidget(val)
+        container.value_label = val
         return container
 
     def create_plot(self, title, color):
-        # Создаем PlotWidget с заголовком
         pw = pg.PlotWidget(title=title)
-
-        # --- Стилизация графика (Рисунок 1) ---
-        # 1. Сетка
-        pw.showGrid(x=True, y=True, alpha=0.3)
-
-        # 2. Настройка осей (шрифт, цвет)
-        font = QFont("Segoe UI", 9)
-        pw.getAxis('left').setTickFont(font)
-        pw.getAxis('bottom').setTickFont(font)
-        pw.getAxis('left').setPen('#808080')
-        pw.getAxis('bottom').setPen('#808080')
-
-        # 3. Настройка заголовка (цвет, шрифт)
-        title_item = pw.getPlotItem().titleLabel
-        title_item.setText(title, color='#ffffff', size='11pt')
-        title_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-
-        # 4. Прозрачность фона самого графика
-        pw.setBackground(None)
-
-        # 5. Линия графика: делаем её толще и сглаженной
-        pen = pg.mkPen(color, width=2.5)  # Толщина
-        curve = pw.plot(pen=pen, antialias=True)  # Сглаживание (antialias)
-
+        pw.showGrid(x=True, y=True, alpha=0.2)
+        pw.getAxis('left').setPen('#444')
+        pw.getAxis('bottom').setPen('#444')
+        pen = pg.mkPen(color=color, width=2)
+        curve = pw.plot(pen=pen, antialias=True)
         return pw, curve
 
-    # --- МЕТОДЫ ОБНОВЛЕНИЯ И ЛОГИКИ (БЕЗ ИЗМЕНЕНИЙ ЛОГИКИ) ---
+    def on_tab_changed(self, index):
+        """Скрывает или показывает Unity в зависимости от активной вкладки"""
+        if self.unity_hwnd:
+            # Показываем только на вкладке 'Real-Time Data' (индекс 1)
+            if index == 1:
+                win32gui.ShowWindow(self.unity_hwnd, win32con.SW_SHOW)
+                self.resize_exe()
+            else:
+                win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
+
     def update_graphs(self, values):
         for i, key in enumerate(['r', 'p', 'y']):
             self.buffer[key] = np.roll(self.buffer[key], -1)
             self.buffer[key][-1] = values[i]
-
-        # Обновляем данные на графиках
         self.curve_r.setData(self.buffer['r'])
         self.curve_p.setData(self.buffer['p'])
         self.curve_y.setData(self.buffer['y'])
@@ -230,18 +184,14 @@ class FlightControlApp(QMainWindow):
     def launch_exe(self):
         load_dotenv()
         target_title = os.getenv("MODEL_NAME", "My project")
-        try:
-            base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__)))
-            model_dir = os.path.join(base_dir, "model")
-            exe_path = os.path.join(model_dir, f"{target_title}.exe")
+        base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        model_dir = os.path.join(base_dir, "model")
+        exe_path = os.path.join(model_dir, f"{target_title}.exe")
 
-            try:
-                subprocess.Popen([exe_path], cwd=model_dir)
-            except FileNotFoundError:
-                return
-
-            for _ in range(20):
+        if os.path.exists(exe_path):
+            subprocess.Popen([exe_path], cwd=model_dir)
+            for _ in range(30):
                 QApplication.processEvents()
                 hwnd = win32gui.FindWindow(None, target_title) or win32gui.FindWindow("UnityWndClass", None)
                 if hwnd:
@@ -252,30 +202,29 @@ class FlightControlApp(QMainWindow):
                                            style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
                     self.resize_exe()
                     break
-                time.sleep(1)
-        except Exception as e:
-            print(f"Error: {e}")
+                time.sleep(0.5)
 
     def resize_exe(self):
+        """Исправляет размер окна Unity под контейнер"""
         if self.unity_hwnd:
-            rect = self.exe_container.geometry()
-            win32gui.MoveWindow(self.unity_hwnd, 0, 0, rect.width(), rect.height(), True)
+            w, h = self.exe_container.width(), self.exe_container.height()
+            win32gui.SetWindowPos(self.unity_hwnd, 0, 0, 0, w, h, win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        QTimer.singleShot(50, self.resize_exe)
+        QTimer.singleShot(30, self.resize_exe)
 
     def closeEvent(self, event):
         target = os.getenv("MODEL_NAME", "MyProject.exe")
         if not target.endswith('.exe'): target += '.exe'
-        if hasattr(self, 'udp_thread'): self.udp_thread.terminate()
+        self.udp_thread.stop()
         os.system(f'taskkill /F /IM "{target}" /T')
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")  # Базовая современная тема
+    app.setStyle("Fusion")
     win = FlightControlApp()
     win.show()
     sys.exit(app.exec())
