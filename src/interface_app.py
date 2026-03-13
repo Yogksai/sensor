@@ -2,50 +2,38 @@ import sys
 import socket
 import subprocess
 import time
-import win32gui
-import win32con
 import os
 import numpy as np
-from PyQt6.QtWidgets import QApplication, QMainWindow, QGridLayout, QWidget, QLabel
+import win32gui
+import win32con
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QGridLayout,
+                             QWidget, QLabel, QTabWidget, QVBoxLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtGui import QFont
 import pyqtgraph as pg
 from dotenv import load_dotenv
-import sys
 
-# --- ОБНОВЛЕННЫЙ ПОТОК ПРИЕМА И РЕЛЕЙ ---
+
+# --- МОДУЛЬ СЕТИ ---
 class UDPBridge(QThread):
-    angles_received = pyqtSignal(list)
-    gps_received = pyqtSignal(list)
+    # Сигнал теперь передает словарь: {'type': 'telemetry', 'data': [...]}
+    data_received = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
-        self._run_flag = True # Флаг для безопасной остановки
+        self._run_flag = True
 
     def stop(self):
         self._run_flag = False
 
     def run(self):
         load_dotenv()
-
-        # Безопасное получение портов
-        try:
-            in_port = int(os.getenv("UI_PORT", "5006"))
-        except (ValueError, TypeError):
-            in_port = 5006
-
-        try:
-            out_port = int(os.getenv("UNITY_PORT", "5005"))
-        except (ValueError, TypeError):
-            out_port = 5005
-
-        # Дальше создание сокетов...
-        in_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        in_sock.bind(('127.0.0.1', in_port))
+        in_port = int(os.getenv("UI_PORT", "5006"))
+        out_port = int(os.getenv("UNITY_PORT", "5005"))
 
         in_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         in_sock.bind(('127.0.0.1', in_port))
-        in_sock.settimeout(1.0) # Чтобы цикл не вис на recvfrom
+        in_sock.settimeout(1.0)
 
         out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         unity_addr = ('127.0.0.1', out_port)
@@ -55,129 +43,156 @@ class UDPBridge(QThread):
                 data, _ = in_sock.recvfrom(1024)
                 line = data.decode('utf-8').strip()
                 parts = [float(x) for x in line.split(',')]
+
                 if len(parts) >= 6:
-                    # Релей в Unity
+                    # Релей в Unity (углы)
                     out_sock.sendto(f"{parts[0]:.2f},{parts[1]:.2f},{parts[2]:.2f}".encode(), unity_addr)
-                    self.angles_received.emit(parts[0:3])
-                    self.gps_received.emit(parts[3:6])
-            except socket.timeout:
-                continue
-            except Exception:
+
+                    # Отправляем упакованные данные в интерфейс
+                    self.data_received.emit({
+                        'angles': parts[0:3],
+                        'gps': parts[3:6]
+                    })
+            except (socket.timeout, ValueError, IndexError):
                 continue
 
-# --- ОСТАЛЬНАЯ ЛОГИКА ИНТЕРФЕЙСА (БЕЗ ИЗМЕНЕНИЙ) ---
+
+# --- ОСНОВНОЕ ПРИЛОЖЕНИЕ ---
 class FlightControlApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FCS - 6DOF Telemetry Monitor")
+
+        # 1. КОНФИГУРАЦИЯ (Сюда добавлять новые элементы)
+        self.GRAPH_CONFIG = [
+            {'key': 'roll', 'title': 'ROLL', 'color': 'r', 'index': 0},
+            {'key': 'pitch', 'title': 'PITCH', 'color': 'g', 'index': 1},
+            {'key': 'yaw', 'title': 'YAW', 'color': 'b', 'index': 2},
+            # Чтобы добавить график: {'key': 'speed', 'title': 'SPEED', 'color': 'y', 'index': 6}
+        ]
+
+        self.INDICATOR_CONFIG = [
+            {'label': "ШИРОТА (LAT)", 'color': "#FF0000", 'suffix': "", 'index': 0},
+            {'label': "ДОЛГОТА (LON)", 'color': "#008000", 'suffix': "", 'index': 1},
+            {'label': "ВЫСОТА (ALT)", 'color': "#0000FF", 'suffix': " m", 'index': 2},
+        ]
+
+        self.init_ui()
+        self.init_threads()
+
+    def init_ui(self):
+        self.setWindowTitle("FCS - Modular Telemetry Monitor")
         self.resize(1400, 900)
-        self.max_points = 100
-        self.buffer = {'r': np.zeros(self.max_points), 'p': np.zeros(self.max_points), 'y': np.zeros(self.max_points)}
 
         central_widget = QWidget()
-        self.layout = QGridLayout(central_widget)
         self.setCentralWidget(central_widget)
+        self.main_layout = QGridLayout(central_widget)
 
-        # Индикаторы
-        self.ind_lat = self.create_indicator("ШИРОТА (LAT)", "#FF0000")
-        self.ind_lon = self.create_indicator("ДОЛГОТА (LON)", "#008000")
-        self.ind_alt = self.create_indicator("ВЫСОТА (ALT)", "#0000FF")
-        self.layout.addWidget(self.ind_lat, 0, 0); self.layout.addWidget(self.ind_lon, 0, 1); self.layout.addWidget(self.ind_alt, 0, 2)
+        # Создаем вкладки (Tabs) для удобства расширения
+        self.tabs = QTabWidget()
+        self.main_layout.addWidget(self.tabs, 1, 0, 3, 1)  # Графики слева
 
-        # Графики
-        self.pw_r, self.curve_r = self.create_plot("ROLL", 'r')
-        self.pw_p, self.curve_p = self.create_plot("PITCH", 'g')
-        self.pw_y, self.curve_y = self.create_plot("YAW", 'b')
-        self.layout.addWidget(self.pw_r, 1, 0); self.layout.addWidget(self.pw_p, 2, 0); self.layout.addWidget(self.pw_y, 3, 0)
+        # --- БЛОК ИНДИКАТОРОВ (ВЕРХ) ---
+        self.indicators = {}
+        for i, cfg in enumerate(self.INDICATOR_CONFIG):
+            ind = self.create_indicator(cfg['label'], cfg['color'])
+            self.main_layout.addWidget(ind, 0, i)
+            self.indicators[cfg['index']] = ind
 
-        # Unity
+        # --- БЛОК ГРАФИКОВ ---
+        # Создаем прокручиваемую область или вкладки под графики
+        graph_container = QWidget()
+        graph_layout = QVBoxLayout(graph_container)
+
+        self.plots = {}
+        self.max_points = 100
+
+        for cfg in self.GRAPH_CONFIG:
+            pw, curve = self.create_plot(cfg['title'], cfg['color'])
+            graph_layout.addWidget(pw)
+            self.plots[cfg['key']] = {
+                'curve': curve,
+                'data': np.zeros(self.max_points),
+                'index': cfg['index']
+            }
+
+        self.tabs.addTab(graph_container, "Телеметрия")
+        self.tabs.addTab(QWidget(), "Доп. настройки")  # Заглушка под новую вкладку
+
+        # --- БЛОК UNITY ---
         self.exe_container = QWidget()
         self.exe_container.setMinimumWidth(800)
         self.exe_container.setStyleSheet("background-color: black; border: 2px solid #333;")
-        self.layout.addWidget(self.exe_container, 1, 1, 3, 2)
+        self.main_layout.addWidget(self.exe_container, 1, 1, 3, 2)
 
+    def init_threads(self):
         self.udp_thread = UDPBridge()
-        self.udp_thread.angles_received.connect(self.update_graphs)
-        self.udp_thread.gps_received.connect(self.update_labels)
+        self.udp_thread.data_received.connect(self.process_incoming_data)
         self.udp_thread.start()
 
         self.unity_hwnd = None
         QTimer.singleShot(2000, self.launch_exe)
 
+    # --- ЛОГИКА ОБРАБОТКИ ---
+    def process_incoming_data(self, packet):
+        # Обновляем графики по конфигу
+        angles = packet['angles']
+        for key, plot_obj in self.plots.items():
+            idx = plot_obj['index']
+            if idx < len(angles):
+                plot_obj['data'] = np.roll(plot_obj['data'], -1)
+                plot_obj['data'][-1] = angles[idx]
+                plot_obj['curve'].setData(plot_obj['data'])
+
+        # Обновляем индикаторы по конфигу
+        gps = packet['gps']
+        for idx, ind_widget in self.indicators.items():
+            if idx < len(gps):
+                suffix = next(item['suffix'] for item in self.INDICATOR_CONFIG if item['index'] == idx)
+                ind_widget.value_label.setText(f"{gps[idx]:.6f}{suffix}")
+
+    # --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (БЕЗ ИЗМЕНЕНИЙ) ---
     def create_indicator(self, label_text, color):
-        container = QWidget(); l_layout = QGridLayout(container)
-        val_lbl = QLabel("0.000000"); val_lbl.setFont(QFont("Consolas", 20, QFont.Weight.Bold))
-        val_lbl.setStyleSheet(f"color: {color}; background-color: #222; padding: 10px; border-radius: 5px;")
-        l_layout.addWidget(QLabel(label_text), 0, 0, alignment=Qt.AlignmentFlag.AlignCenter)
-        l_layout.addWidget(val_lbl, 1, 0, alignment=Qt.AlignmentFlag.AlignCenter)
+        container = QWidget()
+        l_layout = QVBoxLayout(container)
+        val_lbl = QLabel("0.000000")
+        val_lbl.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
+        val_lbl.setStyleSheet(f"color: {color}; background-color: #222; padding: 5px; border-radius: 5px;")
+        l_layout.addWidget(QLabel(label_text), alignment=Qt.AlignmentFlag.AlignCenter)
+        l_layout.addWidget(val_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
         container.value_label = val_lbl
         return container
 
     def create_plot(self, title, color):
-        pw = pg.PlotWidget(title=title); pw.setBackground('w')
+        pw = pg.PlotWidget(title=title)
+        pw.setBackground('w')
+        pw.showGrid(x=True, y=True)
         return pw, pw.plot(pen=pg.mkPen(color, width=2))
 
-    def update_graphs(self, values):
-        for i, key in enumerate(['r', 'p', 'y']):
-            self.buffer[key] = np.roll(self.buffer[key], -1); self.buffer[key][-1] = values[i]
-        self.curve_r.setData(self.buffer['r']); self.curve_p.setData(self.buffer['p']); self.curve_y.setData(self.buffer['y'])
-
-    def update_labels(self, nav):
-        self.ind_lat.value_label.setText(f"{nav[0]:.7f}")
-        self.ind_lon.value_label.setText(f"{nav[1]:.7f}")
-        self.ind_alt.value_label.setText(f"{nav[2]:.2f} m")
-
-
     def launch_exe(self):
-        # 1. Загружаем переменные
         load_dotenv()
         target_title = os.getenv("MODEL_NAME", "My project")
-
         try:
-            # 2. УНИВЕРСАЛЬНЫЙ ПУТЬ: работает и в .py, и в собранном .exe
-            if getattr(sys, 'frozen', False):
-                # Если это .exe, папка model лежит рядом с ним
-                base_dir = os.path.dirname(sys.executable)
-            else:
-                # Если это скрипт, поднимаемся на уровень выше от src
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
+            base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))
             model_dir = os.path.join(base_dir, "model")
             exe_path = os.path.join(model_dir, f"{target_title}.exe")
 
-            # 3. ЗАПУСК
-            try:
-                subprocess.Popen([exe_path], cwd=model_dir)
-            except FileNotFoundError:
-                print(f"Ошибка: Не найден {exe_path}")
-                return
+            subprocess.Popen([exe_path], cwd=model_dir)
 
-            # 4. ПОИСК И ВСТРАИВАНИЕ
             for _ in range(20):
-                QApplication.processEvents() # Чтобы интерфейс не замерзал
-
-                # Ищем сначала по точному имени, потом по классу Unity
-                hwnd = win32gui.FindWindow(None, target_title)
-                if not hwnd:
-                    hwnd = win32gui.FindWindow("UnityWndClass", None)
-
+                QApplication.processEvents()
+                hwnd = win32gui.FindWindow(None, target_title) or win32gui.FindWindow("UnityWndClass", None)
                 if hwnd:
                     self.unity_hwnd = hwnd
-                    # Принудительно вклеиваем в контейнер
                     win32gui.SetParent(self.unity_hwnd, int(self.exe_container.winId()))
-
-                    # Убираем рамки окна
                     style = win32gui.GetWindowLong(self.unity_hwnd, win32con.GWL_STYLE)
                     win32gui.SetWindowLong(self.unity_hwnd, win32con.GWL_STYLE,
                                            style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
-
                     self.resize_exe()
-                    print(f"Модель '{target_title}' успешно встроена.")
                     break
                 time.sleep(1)
-
         except Exception as e:
-            print(f"Error in launch_exe: {e}")
+            print(f"Error: {e}")
 
     def resize_exe(self):
         if self.unity_hwnd:
@@ -187,24 +202,13 @@ class FlightControlApp(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         QTimer.singleShot(50, self.resize_exe)
-    # ... твой существующий код ...
 
     def closeEvent(self, event):
-        """Метод вызывается автоматически при закрытии окна"""
-        print("Закрытие приложения. Очистка процессов...")
         target = os.getenv("MODEL_NAME", "MyProject.exe")
-        if not target.endswith('.exe'):
-            target += '.exe'
-        # 1. Останавливаем поток приема данных
-        if hasattr(self, 'udp_thread'):
-            self.udp_thread.terminate()
-
-        # 2. Принудительно убиваем Unity, чтобы освободить порт 5005
-        # Используем /F (принудительно) и /T (вместе с дочерними процессами)
+        if not target.endswith('.exe'): target += '.exe'
+        if hasattr(self, 'udp_thread'): self.udp_thread.stop()
         os.system(f'taskkill /F /IM "{target}" /T')
-
-        event.accept() # Подтверждаем закрытие окна
-
+        event.accept()
 
 
 if __name__ == "__main__":
