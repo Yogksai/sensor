@@ -159,12 +159,12 @@ class FlightControlApp(QMainWindow):
         return pw, curve
 
     def on_tab_changed(self, index):
-        """Скрывает или показывает Unity в зависимости от активной вкладки"""
+        """Скрывает или показывает Unity и форсирует обновление размера"""
         if self.unity_hwnd:
-            # Показываем только на вкладке 'Real-Time Data' (индекс 1)
-            if index == 1:
+            if index == 1:  # Вкладка Real-Time Data
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_SHOW)
-                self.resize_exe()
+                # Даем Qt 10мс отрисовать вкладку, затем растягиваем Unity
+                QTimer.singleShot(10, self.resize_exe)
             else:
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
 
@@ -205,10 +205,24 @@ class FlightControlApp(QMainWindow):
                 time.sleep(0.5)
 
     def resize_exe(self):
-        """Исправляет размер окна Unity под контейнер"""
-        if self.unity_hwnd:
-            w, h = self.exe_container.width(), self.exe_container.height()
-            win32gui.SetWindowPos(self.unity_hwnd, 0, 0, 0, w, h, win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)
+        """Растягивает Unity на весь доступный контейнер без зазоров"""
+        if self.unity_hwnd and self.exe_container.isVisible():
+            # Получаем точные размеры черного контейнера
+            w = self.exe_container.width()
+            h = self.exe_container.height()
+
+            # Если размеры слишком маленькие (окно еще не прогрузилось), выходим
+            if w < 10 or h < 10:
+                return
+
+            # Флаги: NOZORDER (не менять слой), FRAMECHANGED (пересчитать рамки)
+            flags = win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW
+
+            # Устанавливаем окно в 0,0 относительно контейнера
+            win32gui.SetWindowPos(self.unity_hwnd, 0, 0, 0, w, h, flags)
+
+            # Принудительное обновление для избавления от черных полос
+            win32gui.UpdateWindow(self.unity_hwnd)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
