@@ -26,7 +26,6 @@ class UDPBridge(QThread):
     def run(self):
         load_dotenv()
         in_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Убедись, что UI_PORT в .env совпадает с портом в эмуляторе
         in_sock.bind(('127.0.0.1', int(os.getenv("UI_PORT", "5006"))))
         in_sock.settimeout(0.5)
 
@@ -38,7 +37,6 @@ class UDPBridge(QThread):
                 data, _ = in_sock.recvfrom(1024)
                 parts = [float(x) for x in data.decode('utf-8').strip().split(',')]
                 if len(parts) >= 6:
-                    # Проброс в Unity (Roll, Pitch, Yaw)
                     out_sock.sendto(f"{parts[0]:.2f},{parts[1]:.2f},{parts[2]:.2f}".encode(), unity_addr)
                     self.data_received.emit(parts)
             except: continue
@@ -50,7 +48,6 @@ class FlightControlApp(QMainWindow):
         self.setWindowTitle("FCS - Integrated Monitor")
         self.resize(1600, 950)
 
-        # СЕРОЕ ОФОРМЛЕНИЕ
         self.setStyleSheet("""
             QMainWindow { background-color: #2b2b2b; }
             QTabWidget::pane { border: 1px solid #444; background: #2b2b2b; }
@@ -62,6 +59,13 @@ class FlightControlApp(QMainWindow):
         # Данные
         self.traj_x, self.traj_y, self.traj_y_smooth = [], [], []
         self.speed_data, self.accel_data, self.alt_history = [], [], []
+
+        # --- ФИКС: Переменные для автономного графика ---
+        self.virtual_dist = 0.0
+        self.last_update_t = time.time()
+        self.is_flying = False
+        self.last_raw_data = [0.0] * 6
+
         self.max_pts = 150
         self.buffer = {'r': np.zeros(self.max_pts), 'p': np.zeros(self.max_pts), 'y': np.zeros(self.max_pts)}
         self.start_gps = None
@@ -107,6 +111,10 @@ class FlightControlApp(QMainWindow):
 
         self.pw_traj = pg.PlotWidget(title="Trajectory Analysis (Yellow: Raw, Blue: Filtered)")
         self.pw_traj.showGrid(x=True, y=True, alpha=0.3)
+        # Оптимизация: не рисуем лишние детали
+        self.pw_traj.setDownsampling(auto=True, mode='mean')
+        self.pw_traj.setClipToView(True)
+
         self.curve_raw = self.pw_traj.plot(pen=pg.mkPen(color='#FFFF00', width=1))
         self.curve_smooth = self.pw_traj.plot(pen=pg.mkPen(color='#0000FF', width=3))
         an_left.addWidget(self.pw_traj, stretch=3)
@@ -131,12 +139,20 @@ class FlightControlApp(QMainWindow):
         self.tabs.addTab(self.analyze_tab, "Analyze")
         self.tabs.setCurrentIndex(2)
 
+        # --- ФИКС: Работа через таймер вместо прямого вызова (разгрузка CPU) ---
         self.udp = UDPBridge()
-        self.udp.data_received.connect(self.update_all)
+        self.udp.data_received.connect(self.store_data)
         self.udp.start()
+
+        self.ui_timer = QTimer()
+        self.ui_timer.timeout.connect(self.update_all)
+        self.ui_timer.start(33) # 30 FPS
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         QTimer.singleShot(2000, self.launch_exe)
+
+    def store_data(self, data):
+        self.last_raw_data = data
 
     def create_rt_indicator(self, txt, col):
         w = QWidget(); v = QVBoxLayout(w)
@@ -166,45 +182,56 @@ class FlightControlApp(QMainWindow):
         w.val_label = val
         return w
 
-    def update_all(self, data):
+    def update_all(self):
+        data = self.last_raw_data
         r, p, y, lat, lon, alt = data
         t_now = time.time()
+        dt = t_now - self.last_update_t
+        self.last_update_t = t_now
 
-        # --- ФИКС БАГА С ПЕРЕЗАПУСКОМ ---
-        # Если высота сбросилась в 0, а данных много - чистим всё
-        if alt < 0.5 and len(self.traj_y) > 10:
+        # Автономное движение графика по X
+        if alt > 1.0:
+            self.is_flying = True
+            self.virtual_dist += 150.0 * dt
+
+        if alt < 0.5 and self.is_flying and len(self.traj_y) > 10:
             self.traj_x, self.traj_y, self.traj_y_smooth = [], [], []
             self.speed_data, self.accel_data, self.alt_history = [], [], []
-            self.start_gps = (lat, lon)
+            self.virtual_dist = 0.0
+            self.is_flying = False
 
-        if self.start_gps is None: self.start_gps = (lat, lon)
-        dist = np.sqrt(((lat - self.start_gps[0])*111111)**2 + ((lon - self.start_gps[1])*111111)**2)
+        if self.is_flying or alt > 0.5:
+            self.traj_x.append(self.virtual_dist)
+            self.traj_y.append(alt)
+            # Сглаживание
+            window = 10
+            avg_y = sum(self.traj_y[-window:]) / len(self.traj_y[-window:])
+            self.traj_y_smooth.append(avg_y)
 
-        self.traj_x.append(dist)
-        self.traj_y.append(alt)
-
-        # Сглаживание траектории
-        window = 10
-        avg_y = sum(self.traj_y[-window:]) / len(self.traj_y[-window:])
-        self.traj_y_smooth.append(avg_y)
-
-        # Update RT Data
+        # Update RT Text
         self.rt_lat.val_label.setText(f"{lat:.7f}")
         self.rt_lon.val_label.setText(f"{lon:.7f}")
         self.rt_alt.val_label.setText(f"{alt:.1f} m")
-        for i, key in enumerate(['r', 'p', 'y']):
-            self.buffer[key] = np.roll(self.buffer[key], -1)
-            self.buffer[key][-1] = data[i]
-        self.curve_r.setData(self.buffer['r'])
-        self.curve_p.setData(self.buffer['p'])
-        self.curve_y.setData(self.buffer['y'])
 
-        # Update Analyze
-        if self.tabs.currentIndex() == 2:
-            self.curve_raw.setData(self.traj_x, self.traj_y)
-            self.curve_smooth.setData(self.traj_x, self.traj_y_smooth)
+        curr_tab = self.tabs.currentIndex()
+        if curr_tab == 1:
+            for i, key in enumerate(['r', 'p', 'y']):
+                self.buffer[key] = np.roll(self.buffer[key], -1)
+                self.buffer[key][-1] = data[i]
+            self.curve_r.setData(self.buffer['r'])
+            self.curve_p.setData(self.buffer['p'])
+            self.curve_y.setData(self.buffer['y'])
 
-            # Синусоиды для визуала
+        elif curr_tab == 2:
+            # --- ФИКС: Безопасная отрисовка только последних 2000 точек ---
+            disp_x = self.traj_x[-2000:]
+            count = len(disp_x)
+            disp_y_raw = self.traj_y[-count:]
+
+            self.curve_raw.setData(disp_x, disp_y_raw)
+            if len(self.traj_y_smooth) >= count:
+                self.curve_smooth.setData(disp_x, self.traj_y_smooth[-count:])
+
             self.speed_data.append(40 * np.sin(t_now * 1.5) + 100)
             self.accel_data.append(10 * np.sin(t_now * 4.0) + np.random.normal(0, 0.5))
             self.alt_history.append(alt)
@@ -219,17 +246,32 @@ class FlightControlApp(QMainWindow):
             self.ind_temp.val_label.setText(f"{tmp}°C")
             if self.battery > 5: self.battery -= 0.001
             self.ind_bat.val_label.setText(f"{int(self.battery)}%")
-            self.ind_rssi.val_label.setText("75")
+            self.ind_rssi.val_label.setText(str(74 + np.random.randint(-1, 3)))
 
     def on_tab_changed(self, i):
         if self.unity_hwnd:
-            win32gui.ShowWindow(self.unity_hwnd, win32con.SW_SHOW if i == 1 else win32con.SW_HIDE)
-            if i == 1: QTimer.singleShot(50, self.resize_exe)
+            if i == 1:  # Вкладка Real-Time
+                win32gui.ShowWindow(self.unity_hwnd, win32con.SW_SHOW)
+                # Даем Qt время отрисовать вкладку, прежде чем подгонять Unity
+                QTimer.singleShot(150, self.resize_exe)
+            else:
+                win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
 
     def resize_exe(self):
         if self.unity_hwnd and self.exe_container.isVisible():
-            r = self.exe_container.geometry()
-            win32gui.SetWindowPos(self.unity_hwnd, 0, 0, 0, r.width(), r.height(), win32con.SWP_SHOWWINDOW)
+            # Получаем реальные размеры контейнера в пикселях
+            rect = self.exe_container.rect()
+            point = self.exe_container.mapToGlobal(rect.topLeft())
+
+            # Насильно втискиваем Unity в рамки
+            win32gui.SetWindowPos(
+                self.unity_hwnd,
+                win32con.HWND_TOP,
+                0, 0,
+                self.exe_container.width(),
+                self.exe_container.height(),
+                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW
+            )
 
     def launch_exe(self):
         load_dotenv()
