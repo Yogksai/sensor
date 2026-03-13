@@ -14,7 +14,7 @@ import pyqtgraph as pg
 from dotenv import load_dotenv
 
 
-# --- МОДУЛЬ СЕТИ (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- МОДУЛЬ СЕТИ ---
 class UDPBridge(QThread):
     angles_received = pyqtSignal(list)
     gps_received = pyqtSignal(list)
@@ -64,54 +64,64 @@ class FlightControlApp(QMainWindow):
 
         self.max_points = 150
         self.buffer = {'r': np.zeros(self.max_points), 'p': np.zeros(self.max_points), 'y': np.zeros(self.max_points)}
+
+        # Данные траектории
+        self.traj_x = []
+        self.traj_y = []
+        self.start_gps = None
         self.unity_hwnd = None
 
-        # ГЛАВНЫЙ LAYOUT (Теперь просто на все окно)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        self.main_layout = QVBoxLayout(central_widget)  # Вертикальный для вкладок
+        self.main_layout = QVBoxLayout(central_widget)
 
         self.tabs = QTabWidget()
         self.main_layout.addWidget(self.tabs)
 
-        # --- ВКЛАДКА REAL-TIME DATA (Здесь и графики, и Unity) ---
+        # --- ВКЛАДКА REAL-TIME DATA ---
         self.rt_widget = QWidget()
-        self.rt_content_layout = QHBoxLayout(self.rt_widget)  # ГОРИЗОНТАЛЬНЫЙ внутри вкладки
+        self.rt_content_layout = QHBoxLayout(self.rt_widget)
 
-        # Левая колонка во вкладке: Индикаторы и Графики
         left_column = QVBoxLayout()
         ind_row = QHBoxLayout()
         self.ind_lat = self.create_indicator("LATITUDE", "#FF4444")
         self.ind_lon = self.create_indicator("LONGITUDE", "#44FF44")
         self.ind_alt = self.create_indicator("ALTITUDE", "#4444FF")
-        ind_row.addWidget(self.ind_lat);
-        ind_row.addWidget(self.ind_lon);
-        ind_row.addWidget(self.ind_alt)
+        ind_row.addWidget(self.ind_lat); ind_row.addWidget(self.ind_lon); ind_row.addWidget(self.ind_alt)
         left_column.addLayout(ind_row)
 
         pg.setConfigOption('background', '#121212')
         self.pw_r, self.curve_r = self.create_plot("ROLL", '#FF4444')
         self.pw_p, self.curve_p = self.create_plot("PITCH", '#44FF44')
         self.pw_y, self.curve_y = self.create_plot("YAW", '#4444FF')
-        left_column.addWidget(self.pw_r);
-        left_column.addWidget(self.pw_p);
-        left_column.addWidget(self.pw_y)
+        left_column.addWidget(self.pw_r); left_column.addWidget(self.pw_p); left_column.addWidget(self.pw_y)
 
         self.rt_content_layout.addLayout(left_column, stretch=1)
 
-        # ПРАВАЯ КОЛОНКА ВО ВКЛАДКЕ: Контейнер Unity
         self.exe_container = QWidget()
         self.exe_container.setMinimumWidth(800)
         self.exe_container.setStyleSheet("background-color: #000; border: 1px solid #333;")
         self.rt_content_layout.addWidget(self.exe_container, stretch=2)
 
-        # Другие вкладки (Они будут пустыми и растянутся на все окно)
+        # --- ВКЛАДКА ANALYZE (ТОЛЬКО СИНЯЯ ЛИНИЯ) ---
+        self.analyze_widget = QWidget()
+        analyze_layout = QVBoxLayout(self.analyze_widget)
+
+        self.pw_traj = pg.PlotWidget(title="FLIGHT TRAJECTORY (ALT / DIST)")
+        self.pw_traj.setLabel('bottom', 'Ground Distance', units='m')
+        self.pw_traj.setLabel('left', 'Altitude', units='m')
+        self.pw_traj.showGrid(x=True, y=True, alpha=0.2)
+
+        # Оставил только идеальную синюю линию
+        self.curve_kalman = self.pw_traj.plot(pen=pg.mkPen(color='#0000FF', width=3))
+
+        analyze_layout.addWidget(self.pw_traj)
+
         self.tabs.addTab(QWidget(), "Mission")
         self.tabs.addTab(self.rt_widget, "Real-Time Data")
-        self.tabs.addTab(QWidget(), "Analyze")
+        self.tabs.addTab(self.analyze_widget, "Analyze")
         self.tabs.setCurrentIndex(1)
 
-        # Потоки и таймеры
         self.udp_thread = UDPBridge()
         self.udp_thread.angles_received.connect(self.update_graphs)
         self.udp_thread.gps_received.connect(self.update_labels)
@@ -121,14 +131,11 @@ class FlightControlApp(QMainWindow):
         QTimer.singleShot(2000, self.launch_exe)
 
     def create_indicator(self, label_text, color):
-        container = QWidget();
-        vbox = QVBoxLayout(container)
-        val = QLabel("0.000000");
-        val.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
+        container = QWidget(); vbox = QVBoxLayout(container)
+        val = QLabel("0.000000"); val.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
         val.setStyleSheet(f"color: {color}; background: #1e1e1e; padding: 10px; border: 1px solid #333;")
         val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        vbox.addWidget(QLabel(label_text));
-        vbox.addWidget(val)
+        vbox.addWidget(QLabel(label_text)); vbox.addWidget(val)
         container.value_label = val
         return container
 
@@ -142,41 +149,42 @@ class FlightControlApp(QMainWindow):
         if self.unity_hwnd:
             if index == 1:
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_SHOW)
-                # Даем время Qt пересчитать layout вкладки
                 QTimer.singleShot(50, self.resize_exe)
             else:
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
 
-    def resize_exe(self):
-        """Форсированное растягивание Unity"""
-        if self.unity_hwnd and self.exe_container.isVisible():
-            # Получаем ГЛОБАЛЬНЫЕ координаты контейнера
-            rect = self.exe_container.geometry()
-            # Нам нужны координаты относительно внутреннего окна, поэтому 0,0
-            w, h = rect.width(), rect.height()
+        if index == 2:
+            self.curve_kalman.setData(self.traj_x, self.traj_y)
 
-            if w > 100:  # Защита от сворачивания
-                # SWP_FRAMECHANGED заставляет Unity перерисовать движок под новый размер
+    def resize_exe(self):
+        if self.unity_hwnd and self.exe_container.isVisible():
+            rect = self.exe_container.geometry()
+            w, h = rect.width(), rect.height()
+            if w > 100:
                 win32gui.SetWindowPos(self.unity_hwnd, 0, 0, 0, w, h,
                                       win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
 
     def update_graphs(self, values):
         for i, key in enumerate(['r', 'p', 'y']):
-            self.buffer[key] = np.roll(self.buffer[key], -1);
-            self.buffer[key][-1] = values[i]
-        self.curve_r.setData(self.buffer['r']);
-        self.curve_p.setData(self.buffer['p']);
-        self.curve_y.setData(self.buffer['y'])
+            self.buffer[key] = np.roll(self.buffer[key], -1); self.buffer[key][-1] = values[i]
+        self.curve_r.setData(self.buffer['r']); self.curve_p.setData(self.buffer['p']); self.curve_y.setData(self.buffer['y'])
 
     def update_labels(self, nav):
-        self.ind_lat.value_label.setText(f"{nav[0]:.7f}");
-        self.ind_lon.value_label.setText(f"{nav[1]:.7f}");
-        self.ind_alt.value_label.setText(f"{nav[2]:.2f} m")
+        lat, lon, alt = nav[0], nav[1], nav[2]
+        self.ind_lat.value_label.setText(f"{lat:.7f}"); self.ind_lon.value_label.setText(f"{nav[1]:.7f}"); self.ind_alt.value_label.setText(f"{alt:.2f} m")
+
+        if self.start_gps is None: self.start_gps = (lat, lon)
+        dist = np.sqrt(((lat - self.start_gps[0]) * 111111)**2 + ((lon - self.start_gps[1]) * 111111 * np.cos(np.radians(lat)))**2)
+
+        self.traj_x.append(dist)
+        self.traj_y.append(alt)
+
+        if self.tabs.currentIndex() == 2 and len(self.traj_x) % 5 == 0:
+            self.curve_kalman.setData(self.traj_x, self.traj_y)
 
     def launch_exe(self):
         load_dotenv()
         target_title = os.getenv("MODEL_NAME", "My project")
-        # Упрощенный поиск пути
         exe_path = os.path.join(os.getcwd(), "model", f"{target_title}.exe")
         if os.path.exists(exe_path):
             subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
@@ -184,28 +192,17 @@ class FlightControlApp(QMainWindow):
                 QApplication.processEvents()
                 hwnd = win32gui.FindWindow(None, target_title) or win32gui.FindWindow("UnityWndClass", None)
                 if hwnd:
-                    self.unity_hwnd = hwnd
-                    win32gui.SetParent(self.unity_hwnd, int(self.exe_container.winId()))
-                    style = win32gui.GetWindowLong(self.unity_hwnd, win32con.GWL_STYLE)
-                    win32gui.SetWindowLong(self.unity_hwnd, win32con.GWL_STYLE,
-                                           style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
-                    self.resize_exe()
-                    break
+                    self.unity_hwnd = hwnd; win32gui.SetParent(hwnd, int(self.exe_container.winId()))
+                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
+                    self.resize_exe(); break
                 time.sleep(0.5)
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        QTimer.singleShot(50, self.resize_exe)
+        super().resizeEvent(event); QTimer.singleShot(50, self.resize_exe)
 
     def closeEvent(self, event):
-        self.udp_thread.stop()
-        os.system(f'taskkill /F /IM "{os.getenv("MODEL_NAME", "My project")}.exe" /T')
-        event.accept()
-
+        self.udp_thread.stop(); os.system(f'taskkill /F /IM "{os.getenv("MODEL_NAME", "My project")}.exe" /T'); event.accept()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = FlightControlApp()
-    win.show()
-    sys.exit(app.exec())
+    app = QApplication(sys.argv); app.setStyle("Fusion"); win = FlightControlApp(); win.show(); sys.exit(app.exec())
