@@ -25,6 +25,10 @@ def run_telemetry_logic():
         print(f"\n[Критическая ошибка моста]: {e}")
 
 def main():
+    # Перед стартом чистим старые процессы, чтобы файлы не были заняты
+    print("Проверка запущенных копий")
+    os.system('taskkill /F /IM "My project.exe" /T >nul 2>&1')
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     print("SYSTEM STARTUP")

@@ -29,32 +29,33 @@ def quat_to_euler(w, x, y, z):
     return roll, pitch, yaw
 
 def run_converter(port_name):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    parser = TelemetryParser()
+    # Создаем сокет в контекстном менеджере, чтобы он закрылся сам
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        parser = TelemetryParser()
+        print(f"BRIDGE STARTED ON {port_name}")
 
+        try:
+            # Если get_serial_data возвращает генератор,
+            # нам нужно убедиться, что внутри него закрывается порт.
+            for raw_text in get_serial_data(port_name):
+                if not raw_text:
+                    continue
 
+                data = parser.parse(raw_text)
+                if data:
+                    r, p, y = quat_to_euler(*data['quat'])
+                    lat, lon, alt = data.get('lat', 0), data.get('lon', 0), data.get('alt', 0)
+                    s1, s2, s3, s4 = data.get('servos', [0, 0, 0, 0])
 
-    print(f"BRIDGE STARTED ON {serial_port}")
-    try:
-        for raw_text in get_serial_data(port_name):
-            if not raw_text:
-                continue
-
-            data = parser.parse(raw_text)
-            if data:
-                r, p, y = quat_to_euler(*data['quat'])
-                lat, lon, alt = data.get('lat', 0), data.get('lon', 0), data.get('alt', 0)
-                s1, s2, s3, s4 = data.get('servos', [0,0,0,0])
-
-                # Прокидываем в Интерфейс 10 параметров
-                ui_payload = f"{r:.2f},{p:.2f},{y:.2f},{lat:.7f},{lon:.7f},{alt:.2f},{s1:.1f},{s2:.1f},{s3:.1f},{s4:.1f}"
-                sock.sendto(ui_payload.encode(), UI_ADDR)
-
-                # (Unity данные интерфейс сам перешлет на 5005, как у тебя в коде)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        logger.stop_logging()
+                    ui_payload = f"{r:.2f},{p:.2f},{y:.2f},{lat:.7f},{lon:.7f},{alt:.2f},{s1:.1f},{s2:.1f},{s3:.1f},{s4:.1f}"
+                    sock.sendto(ui_payload.encode(), UI_ADDR)
+        except Exception as e:
+            print(f"Ошибка в цикле конвертера: {e}")
+        finally:
+            logger.stop_logging()
+            # ВАЖНО: Если у тебя есть доступ к объекту serial внутри get_serial_data,
+            # он должен закрываться там через try...finally.
+            print("Конвертер остановлен, ресурсы освобождены.")
 
 if __name__ == "__main__":
     run_converter()

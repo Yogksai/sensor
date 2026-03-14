@@ -8,7 +8,7 @@ import numpy as np
 import win32gui
 import win32con
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
-                             QTabWidget, QVBoxLayout, QHBoxLayout)
+                             QTabWidget, QVBoxLayout, QHBoxLayout, QSizePolicy)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtGui import QFont
 import pyqtgraph as pg
@@ -105,22 +105,46 @@ class FlightControlApp(QMainWindow):
     def init_mission_tab(self):
         self.mission_tab = QWidget()
         m_layout = QHBoxLayout(self.mission_tab)
+        # Минимальные отступы, чтобы использовать всё пространство
+        m_layout.setContentsMargins(5, 5, 5, 5)
+        m_layout.setSpacing(10)
+
+        # --- ЛЕВАЯ ПАНЕЛЬ (Индикаторы и Графики) ---
         m_left = QVBoxLayout()
+
+        # Создаем индикаторы (теперь они точно будут существовать для update_all)
         m_ind_row = QHBoxLayout()
         self.rt_lat = self.create_indicator("LATITUDE", "#FF4444")
         self.rt_lon = self.create_indicator("LONGITUDE", "#44FF44")
         self.rt_alt = self.create_indicator("ALTITUDE", "#4444FF")
-        m_ind_row.addWidget(self.rt_lat); m_ind_row.addWidget(self.rt_lon); m_ind_row.addWidget(self.rt_alt)
+
+        m_ind_row.addWidget(self.rt_lat)
+        m_ind_row.addWidget(self.rt_lon)
+        m_ind_row.addWidget(self.rt_alt)
         m_left.addLayout(m_ind_row)
+
+        # Создаем графики углов
         self.pw_r, self.curve_r = self.create_plot("ROLL", "#FF4444")
         self.pw_p, self.curve_p = self.create_plot("PITCH", "#44FF44")
         self.pw_y, self.curve_y = self.create_plot("YAW", "#4444FF")
-        m_left.addWidget(self.pw_r); m_left.addWidget(self.pw_p); m_left.addWidget(self.pw_y)
-        m_layout.addLayout(m_left, stretch=1)
+
+        m_left.addWidget(self.pw_r)
+        m_left.addWidget(self.pw_p)
+        m_left.addWidget(self.pw_y)
+
+        # Добавляем левую панель в основной лейаут (30% ширины)
+        m_layout.addLayout(m_left, stretch=3)
+
+        # --- ПРАВАЯ ПАНЕЛЬ (Unity) ---
         self.exe_container = QWidget()
-        self.exe_container.setMinimumWidth(800)
         self.exe_container.setStyleSheet("background: #000; border: 1px solid #444;")
-        m_layout.addWidget(self.exe_container, stretch=2)
+
+        # Важно: устанавливаем политику расширения
+        self.exe_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        # Добавляем контейнер напрямую (70% ширины)
+        m_layout.addWidget(self.exe_container, stretch=7)
+
         self.tabs.addTab(self.mission_tab, "Mission")
 
     def init_rt_data_tab(self):
@@ -303,30 +327,79 @@ class FlightControlApp(QMainWindow):
             else:
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
 
+
     def resize_exe(self):
         if self.unity_hwnd and self.exe_container.isVisible():
-            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP, 0, 0,
-                                  self.exe_container.width(), self.exe_container.height(),
-                                  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
+            # Получаем реальный размер, который PyQt выделил под виджет
+            rect = self.exe_container.geometry()
+            w, h = rect.width(), rect.height()
+
+            # Коэффициент "перекрытия".
+            # Если полоски по 5% с каждой стороны, увеличиваем ширину на 10%
+            # Попробуй менять эти значения, пока полоски не уйдут
+            zoom_factor = 1.05
+
+            new_w = int(w * zoom_factor)
+            new_h = int(h * zoom_factor)
+
+            # Центрируем увеличенное окно Unity относительно контейнера
+            off_x = (new_w - w) // 2
+            off_y = (new_h - h) // 2
+
+            win32gui.SetWindowPos(
+                self.unity_hwnd,
+                win32con.HWND_TOP,
+                -off_x, -off_y,
+                new_w, new_h,
+                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
+            )
+            # Отправляем сообщение о новом размере
+            win32gui.SendMessage(self.unity_hwnd, win32con.WM_SIZE, 0, (new_h << 16) | new_w)
 
     def launch_exe(self):
         load_dotenv()
         t = os.getenv("MODEL_NAME", "My project")
         p = os.path.join(os.getcwd(), "model", f"{t}.exe")
         if os.path.exists(p):
-            subprocess.Popen([p], cwd=os.path.dirname(p))
+            # Запускаем Unity с аргументами, запрещающими выбор разрешения и фиксированный Aspect Ratio
+            # -screen-fullscreen 0 (в окне)
+            # -parentHWND ... (можно пробовать передать сразу, но мы делаем через SetParent)
+            subprocess.Popen([p, "-screen-fullscreen", "0"], cwd=os.path.dirname(p))
+
             for _ in range(40):
                 QApplication.processEvents()
                 h = win32gui.FindWindow(None, t) or win32gui.FindWindow("UnityWndClass", None)
                 if h:
                     self.unity_hwnd = h
                     win32gui.SetParent(h, int(self.exe_container.winId()))
-                    s = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
-                    win32gui.SetWindowLong(h, win32con.GWL_STYLE, s & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
-                    self.resize_exe(); break
+
+                    # Убираем рамки окна Unity
+                    style = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
+                    win32gui.SetWindowLong(h, win32con.GWL_STYLE, style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
+
+                    # Вызываем resize сразу после захвата
+                    self.resize_exe()
+                    break
                 time.sleep(0.5)
 
     def resizeEvent(self, e): super().resizeEvent(e); QTimer.singleShot(50, self.resize_exe)
+    def closeEvent(self, e):
+        """Вызывается при закрытии окна"""
+        print("Завершение работы системы...")
+
+        # Останавливаем сетевой мост
+        if hasattr(self, 'udp'):
+            self.udp.stop()
+            self.udp.wait() # Ждем завершения потока
+
+        # Убиваем процесс Unity
+        try:
+            # /F - принудительно, /T - со всеми дочерними (handler), /IM - по имени
+            os.system(f'taskkill /F /IM "My project.exe" /T')
+        except:
+            pass
+
+        e.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv); app.setStyle("Fusion")
