@@ -27,7 +27,6 @@ class UDPBridge(QThread):
     def run(self):
         load_dotenv()
         in_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Ожидаем данные от конвертера (Bridge)
         in_sock.bind(('127.0.0.1', int(os.getenv("UI_PORT", "5006"))))
         in_sock.settimeout(0.5)
 
@@ -37,10 +36,8 @@ class UDPBridge(QThread):
         while self._run_flag:
             try:
                 data, _ = in_sock.recvfrom(1024)
-                # Теперь ожидаем 10 параметров: r,p,y,lat,lon,alt,s1,s2,s3,s4
                 parts = [float(x) for x in data.decode('utf-8').strip().split(',')]
                 if len(parts) >= 6:
-                    # В Unity шлем только углы
                     out_sock.sendto(f"{parts[0]:.2f},{parts[1]:.2f},{parts[2]:.2f}".encode(), unity_addr)
                     self.data_received.emit(parts)
             except: continue
@@ -61,16 +58,21 @@ class FlightControlApp(QMainWindow):
         """)
 
         # Данные
-        self.traj_x, self.traj_y, self.traj_y_smooth = [], [], []
+        self.traj_x, self.traj_y = [], []
         self.speed_data, self.accel_data, self.alt_history = [], [], []
+        self.r_buf = []
         self.virtual_dist = 0.0
         self.last_update_t = time.time()
         self.is_flying = False
-        self.last_raw_data = [0.0] * 10  # Расширено до 10
+        self.last_raw_data = [0.0] * 10
         self.max_pts = 150
         self.buffer = {'r': np.zeros(self.max_pts), 'p': np.zeros(self.max_pts), 'y': np.zeros(self.max_pts)}
         self.battery = 98.0
         self.unity_hwnd = None
+
+        # Параметры цели
+        self.target_x = 16000
+        self.start_deviation = 100.0 # Начальное отклонение для отрисовки прямой
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -81,7 +83,6 @@ class FlightControlApp(QMainWindow):
         pg.setConfigOption('background', '#1e1e1e')
         pg.setConfigOption('foreground', '#dcdcdc')
 
-        # --- ВКЛАДКИ ---
         self.init_mission_tab()
         self.init_rt_data_tab()
         self.init_analyze_tab()
@@ -126,7 +127,7 @@ class FlightControlApp(QMainWindow):
         self.rt_data_tab = QWidget()
         rd_layout = QHBoxLayout(self.rt_data_tab)
         rd_left = QVBoxLayout()
-        self.pw_traj = pg.PlotWidget(title="Trajectory Analysis (Yellow: Raw, Blue: Filtered)")
+        self.pw_traj = pg.PlotWidget(title="Trajectory Analysis")
         self.pw_traj.showGrid(x=True, y=True, alpha=0.3)
         self.curve_raw = self.pw_traj.plot(pen=pg.mkPen(color='#FFFF00', width=1))
         self.curve_smooth = self.pw_traj.plot(pen=pg.mkPen(color='#0000FF', width=3))
@@ -153,8 +154,9 @@ class FlightControlApp(QMainWindow):
         self.pw_an_traj = pg.PlotWidget(title="Trajectory Correction (Active Segment)")
         self.pw_an_traj.showGrid(x=True, y=True, alpha=0.3)
         self.curve_an_traj = self.pw_an_traj.plot(pen=pg.mkPen(color='#0078d7', width=2))
-        self.target_dot = self.pw_an_traj.plot(pen=None, symbol='o', symbolBrush='r', symbolSize=12)
+        self.target_dot_main = self.pw_an_traj.plot(pen=None, symbol='o', symbolBrush='r', symbolSize=12)
         an_left_col.addWidget(self.pw_an_traj)
+
         self.pw_rudders = pg.PlotWidget(title="Aerodynamic Rudders Control")
         self.pw_rudders.showGrid(x=True, y=True, alpha=0.3)
         self.pw_rudders.setYRange(-10, 10)
@@ -164,7 +166,35 @@ class FlightControlApp(QMainWindow):
         self.curve_rudders = self.pw_rudders.plot(pen=pg.mkPen(color='#44FF44', width=1.5))
         an_left_col.addWidget(self.pw_rudders)
         an_layout.addLayout(an_left_col, stretch=2)
-        an_layout.addWidget(QWidget(), stretch=1)
+
+        an_right_col = QVBoxLayout()
+        self.pw_corr_zoom = pg.PlotWidget(title="Коррекция траектории (активный участок + GPS)")
+        self.pw_corr_zoom.showGrid(x=True, y=True, alpha=0.3)
+        self.curve_corr_zoom = self.pw_corr_zoom.plot(pen=pg.mkPen(color='#00FF00', width=2))
+        an_right_col.addWidget(self.pw_corr_zoom)
+
+        self.pw_rudders_zoom = pg.PlotWidget(title="Работа рулей при коррекции (зум)")
+        self.pw_rudders_zoom.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_rudders_zoom.setYRange(-10, 10)
+        self.pw_rudders_zoom.addLine(y=7.5, pen=limit_pen)
+        self.pw_rudders_zoom.addLine(y=-7.5, pen=limit_pen)
+        self.curve_rudders_zoom = self.pw_rudders_zoom.plot(pen=pg.mkPen(color='#44FF44', width=1.5))
+        an_right_col.addWidget(self.pw_rudders_zoom)
+
+        # 3 График: Точность (Прямая линия)
+        self.pw_precision = pg.PlotWidget(title="Точность достижения цели (зум)")
+        self.pw_precision.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_precision.setXRange(0, 18000)
+        self.pw_precision.setYRange(-10, 150)
+        # Уровень цели
+        self.pw_precision.addLine(y=0, pen=pg.mkPen(color='#555', style=Qt.PenStyle.DashLine))
+        self.curve_precision = self.pw_precision.plot(pen=pg.mkPen(color='#0078d7', width=2))
+        # Зеленая точка (Постоянно видна на 16000, 0)
+        self.precision_dot = self.pw_precision.plot(pen=None, symbol='o', symbolBrush='g', symbolSize=12)
+        self.precision_dot.setData([self.target_x], [0])
+
+        an_right_col.addWidget(self.pw_precision)
+        an_layout.addLayout(an_right_col, stretch=2)
         self.tabs.addTab(self.analyze_tab, "Analyze")
 
     def create_indicator(self, txt, col):
@@ -195,29 +225,27 @@ class FlightControlApp(QMainWindow):
         return w
 
     def update_all(self):
-        d = self.last_raw_data # [r,p,y,lat,lon,alt,s1,s2,s3,s4]
+        d = self.last_raw_data
         if len(d) < 6: return
-
         r, p, y, lat, lon, alt = d[0:6]
         t_now = time.time()
         dt = t_now - self.last_update_t
         self.last_update_t = t_now
 
-        # Траектория
         if alt > 1.0:
             self.is_flying = True
             self.virtual_dist += 150.0 * dt
         if alt < 0.5 and self.is_flying:
-            self.traj_x, self.traj_y, self.traj_y_smooth = [], [], []
+            self.traj_x, self.traj_y, self.r_buf = [], [], []
             self.virtual_dist = 0.0
             self.is_flying = False
 
         if self.is_flying or alt > 0.5:
             self.traj_x.append(self.virtual_dist)
             self.traj_y.append(alt)
-            window = 10
-            avg_y = sum(self.traj_y[-window:]) / len(self.traj_y[-window:])
-            self.traj_y_smooth.append(avg_y)
+            if len(d) >= 7:
+                if not hasattr(self, 'r_buf'): self.r_buf = []
+                self.r_buf.append(d[6])
 
         self.rt_lat.val_label.setText(f"{lat:.7f}")
         self.rt_lon.val_label.setText(f"{lon:.7f}")
@@ -232,42 +260,40 @@ class FlightControlApp(QMainWindow):
             self.curve_p.setData(self.buffer['p'])
             self.curve_y.setData(self.buffer['y'])
 
-        elif idx == 1: # Real-Time Data
-            disp_x = self.traj_x[-2000:]; count = len(disp_x)
-            self.curve_raw.setData(disp_x, self.traj_y[-count:])
-            if len(self.traj_y_smooth) >= count:
-                self.curve_smooth.setData(disp_x, self.traj_y_smooth[-count:])
-
-            # ПЛАВНЫЕ ГРАФИКИ БЕЗ ШУМА
-            # Скорость: плавная волна вокруг 120 м/с
+        elif idx == 1:
+            self.curve_raw.setData(self.traj_x, self.traj_y)
             self.speed_data.append(120 + 10 * math.sin(t_now * 0.5))
-            # Ускорение: очень плавная синусоида
             self.accel_data.append(2 * math.sin(t_now * 0.3))
-
             self.alt_history.append(alt)
-
-            # Отрисовка последних 100 точек
             self.curve_speed.setData(self.speed_data[-100:])
             self.curve_accel.setData(self.accel_data[-100:])
             self.curve_alt_plot.setData(self.alt_history[-100:])
-
-            # Обновление текста
             self.ind_bat.val_label.setText(f"{int(self.battery)}%")
-            # Убираем рандом из RSSI, делаем стабильным
             self.ind_rssi.val_label.setText("85")
 
         elif idx == 2:
             if len(self.traj_y) > 0:
                 self.curve_an_traj.setData(self.traj_x, self.traj_y)
-                if alt < 1.0: self.target_dot.setData([self.traj_x[-1]], [0])
-                else: self.target_dot.setData([], [])
+                self.curve_corr_zoom.setData(self.traj_x[-100:], self.traj_y[-100:])
 
-            # РЕАЛЬНЫЕ ДАННЫЕ РУЛЕЙ (S1)
-            if len(d) >= 7:
-                s1_val = d[6]
-                if not hasattr(self, 'r_buf'): self.r_buf = []
-                self.r_buf.append(s1_val)
-                self.curve_rudders.setData(self.r_buf[-150:])
+                if hasattr(self, 'r_buf') and self.r_buf:
+                    self.curve_rudders.setData(self.r_buf[-150:])
+                    self.curve_rudders_zoom.setData(self.r_buf[-50:])
+
+                # Прямая линия точности
+                curr_x = self.traj_x[-1]
+                # Рассчитываем текущее отклонение по прямой: от start_deviation до 0 в точке target_x
+                if curr_x < self.target_x:
+                    ratio = (self.target_x - curr_x) / self.target_x
+                    curr_dev = self.start_deviation * ratio
+                else:
+                    curr_dev = 0
+
+                # Рисуем линию от начала (0, start_deviation) до текущей точки
+                # Это создает эффект "прямого наведения"
+                self.curve_precision.setData([0, curr_x], [self.start_deviation, curr_dev])
+
+                if alt < 1.0: self.target_dot_main.setData([curr_x], [0])
 
     def on_tab_changed(self, i):
         if self.unity_hwnd:
