@@ -241,11 +241,9 @@ class FlightControlApp(QMainWindow):
         t_now = time.time()
         dt = t_now - self.last_update_t
 
-        # ПРАВКА 1: Ограничиваем скачок времени при переключении вкладок
         if dt > 0.5: dt = 0.033
         self.last_update_t = t_now
 
-        # ПРАВКА 2: Постоянно обновляем данные траектории и буферы в фоне
         if alt > 1.0:
             self.is_flying = True
             self.virtual_dist += 150.0 * dt
@@ -266,12 +264,20 @@ class FlightControlApp(QMainWindow):
             self.buffer[key] = np.roll(self.buffer[key], -1)
             self.buffer[key][-1] = d[i]
 
+        # ПРАВКА: Постоянно обновляем списки данных для графиков на вкладке Real-Time
+        self.speed_data.append(120 + 10 * math.sin(t_now * 0.5))
+        self.accel_data.append(2 * math.sin(t_now * 0.3))
+        self.alt_history.append(alt)
+        # Ограничиваем длину списков, чтобы не забивать память
+        self.speed_data = self.speed_data[-150:]
+        self.accel_data = self.accel_data[-150:]
+        self.alt_history = self.alt_history[-150:]
+
         # Текстовые данные обновляем всегда
         self.rt_lat.val_label.setText(f"{lat:.7f}")
         self.rt_lon.val_label.setText(f"{lon:.7f}")
         self.rt_alt.val_label.setText(f"{alt:.1f} m")
 
-        # ПРАВКА 3: Отрисовка происходит только для видимой вкладки, но на базе полных данных
         idx = self.tabs.currentIndex()
         if idx == 0:
             self.curve_r.setData(self.buffer['r'])
@@ -280,12 +286,10 @@ class FlightControlApp(QMainWindow):
 
         elif idx == 1:
             self.curve_raw.setData(self.traj_x, self.traj_y)
-            self.speed_data.append(120 + 10 * math.sin(t_now * 0.5))
-            self.accel_data.append(2 * math.sin(t_now * 0.3))
-            self.alt_history.append(alt)
-            self.curve_speed.setData(self.speed_data[-100:])
-            self.curve_accel.setData(self.accel_data[-100:])
-            self.curve_alt_plot.setData(self.alt_history[-100:])
+            # Теперь здесь только отрисовка уже подготовленных в фоне данных
+            self.curve_speed.setData(self.speed_data)
+            self.curve_accel.setData(self.accel_data)
+            self.curve_alt_plot.setData(self.alt_history)
             self.ind_bat.val_label.setText(f"{int(self.battery)}%")
             self.ind_rssi.val_label.setText("85")
 
@@ -293,18 +297,15 @@ class FlightControlApp(QMainWindow):
             if len(self.traj_y) > 0:
                 self.curve_an_traj.setData(self.traj_x, self.traj_y)
                 self.curve_corr_zoom.setData(self.traj_x[-100:], self.traj_y[-100:])
-
                 if hasattr(self, 'r_buf') and self.r_buf:
                     self.curve_rudders.setData(self.r_buf[-150:])
                     self.curve_rudders_zoom.setData(self.r_buf[-50:])
-
                 curr_x = self.traj_x[-1]
                 if curr_x < self.target_x:
                     ratio = (self.target_x - curr_x) / self.target_x
                     curr_dev = self.start_deviation * ratio
                 else:
                     curr_dev = 0
-
                 self.curve_precision.setData([0, curr_x], [self.start_deviation, curr_dev])
                 if alt < 1.0: self.target_dot_main.setData([curr_x], [0])
 
