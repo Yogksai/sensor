@@ -41,13 +41,13 @@ def run_converter(port_name):
                 continue
 
             data = parser.parse(raw_text)
-            if data and 'quat' in data:
-                # Превращаем кватернион в углы Эйлера
+            if data:
                 r, p, y = quat_to_euler(*data['quat'])
                 lat, lon, alt = data.get('lat', 0), data.get('lon', 0), data.get('alt', 0)
+                s1, s2, s3, s4 = data.get('servos', [0,0,0,0])
 
-                # Прокидываем в Интерфейс (6 параметров)
-                ui_payload = f"{r:.2f},{p:.2f},{y:.2f},{lat:.7f},{lon:.7f},{alt:.2f}"
+                # Прокидываем в Интерфейс 10 параметров
+                ui_payload = f"{r:.2f},{p:.2f},{y:.2f},{lat:.7f},{lon:.7f},{alt:.2f},{s1:.1f},{s2:.1f},{s3:.1f},{s4:.1f}"
                 sock.sendto(ui_payload.encode(), UI_ADDR)
 
                 # (Unity данные интерфейс сам перешлет на 5005, как у тебя в коде)
