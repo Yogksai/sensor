@@ -105,14 +105,10 @@ class FlightControlApp(QMainWindow):
     def init_mission_tab(self):
         self.mission_tab = QWidget()
         m_layout = QHBoxLayout(self.mission_tab)
-        # Минимальные отступы, чтобы использовать всё пространство
         m_layout.setContentsMargins(5, 5, 5, 5)
         m_layout.setSpacing(10)
 
-        # --- ЛЕВАЯ ПАНЕЛЬ (Индикаторы и Графики) ---
         m_left = QVBoxLayout()
-
-        # Создаем индикаторы (теперь они точно будут существовать для update_all)
         m_ind_row = QHBoxLayout()
         self.rt_lat = self.create_indicator("LATITUDE", "#FF4444")
         self.rt_lon = self.create_indicator("LONGITUDE", "#44FF44")
@@ -123,7 +119,6 @@ class FlightControlApp(QMainWindow):
         m_ind_row.addWidget(self.rt_alt)
         m_left.addLayout(m_ind_row)
 
-        # Создаем графики углов
         self.pw_r, self.curve_r = self.create_plot("ROLL", "#FF4444")
         self.pw_p, self.curve_p = self.create_plot("PITCH", "#44FF44")
         self.pw_y, self.curve_y = self.create_plot("YAW", "#4444FF")
@@ -132,17 +127,11 @@ class FlightControlApp(QMainWindow):
         m_left.addWidget(self.pw_p)
         m_left.addWidget(self.pw_y)
 
-        # Добавляем левую панель в основной лейаут (30% ширины)
         m_layout.addLayout(m_left, stretch=3)
 
-        # --- ПРАВАЯ ПАНЕЛЬ (Unity) ---
         self.exe_container = QWidget()
         self.exe_container.setStyleSheet("background: #000; border: 1px solid #444;")
-
-        # Важно: устанавливаем политику расширения
         self.exe_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        # Добавляем контейнер напрямую (70% ширины)
         m_layout.addWidget(self.exe_container, stretch=7)
 
         self.tabs.addTab(self.mission_tab, "Mission")
@@ -205,15 +194,12 @@ class FlightControlApp(QMainWindow):
         self.curve_rudders_zoom = self.pw_rudders_zoom.plot(pen=pg.mkPen(color='#44FF44', width=1.5))
         an_right_col.addWidget(self.pw_rudders_zoom)
 
-        # 3 График: Точность (Прямая линия)
         self.pw_precision = pg.PlotWidget(title="Точность достижения цели (зум)")
         self.pw_precision.showGrid(x=True, y=True, alpha=0.3)
         self.pw_precision.setXRange(0, 18000)
         self.pw_precision.setYRange(-10, 150)
-        # Уровень цели
         self.pw_precision.addLine(y=0, pen=pg.mkPen(color='#555', style=Qt.PenStyle.DashLine))
         self.curve_precision = self.pw_precision.plot(pen=pg.mkPen(color='#0078d7', width=2))
-        # Зеленая точка (Постоянно видна на 16000, 0)
         self.precision_dot = self.pw_precision.plot(pen=None, symbol='o', symbolBrush='g', symbolSize=12)
         self.precision_dot.setData([self.target_x], [0])
 
@@ -254,8 +240,12 @@ class FlightControlApp(QMainWindow):
         r, p, y, lat, lon, alt = d[0:6]
         t_now = time.time()
         dt = t_now - self.last_update_t
+
+        # ПРАВКА 1: Ограничиваем скачок времени при переключении вкладок
+        if dt > 0.5: dt = 0.033
         self.last_update_t = t_now
 
+        # ПРАВКА 2: Постоянно обновляем данные траектории и буферы в фоне
         if alt > 1.0:
             self.is_flying = True
             self.virtual_dist += 150.0 * dt
@@ -271,15 +261,19 @@ class FlightControlApp(QMainWindow):
                 if not hasattr(self, 'r_buf'): self.r_buf = []
                 self.r_buf.append(d[6])
 
+        # Всегда наполняем буферы графиков Mission
+        for i, key in enumerate(['r', 'p', 'y']):
+            self.buffer[key] = np.roll(self.buffer[key], -1)
+            self.buffer[key][-1] = d[i]
+
+        # Текстовые данные обновляем всегда
         self.rt_lat.val_label.setText(f"{lat:.7f}")
         self.rt_lon.val_label.setText(f"{lon:.7f}")
         self.rt_alt.val_label.setText(f"{alt:.1f} m")
 
+        # ПРАВКА 3: Отрисовка происходит только для видимой вкладки, но на базе полных данных
         idx = self.tabs.currentIndex()
         if idx == 0:
-            for i, key in enumerate(['r', 'p', 'y']):
-                self.buffer[key] = np.roll(self.buffer[key], -1)
-                self.buffer[key][-1] = d[i]
             self.curve_r.setData(self.buffer['r'])
             self.curve_p.setData(self.buffer['p'])
             self.curve_y.setData(self.buffer['y'])
@@ -304,19 +298,14 @@ class FlightControlApp(QMainWindow):
                     self.curve_rudders.setData(self.r_buf[-150:])
                     self.curve_rudders_zoom.setData(self.r_buf[-50:])
 
-                # Прямая линия точности
                 curr_x = self.traj_x[-1]
-                # Рассчитываем текущее отклонение по прямой: от start_deviation до 0 в точке target_x
                 if curr_x < self.target_x:
                     ratio = (self.target_x - curr_x) / self.target_x
                     curr_dev = self.start_deviation * ratio
                 else:
                     curr_dev = 0
 
-                # Рисуем линию от начала (0, start_deviation) до текущей точки
-                # Это создает эффект "прямого наведения"
                 self.curve_precision.setData([0, curr_x], [self.start_deviation, curr_dev])
-
                 if alt < 1.0: self.target_dot_main.setData([curr_x], [0])
 
     def on_tab_changed(self, i):
@@ -327,33 +316,16 @@ class FlightControlApp(QMainWindow):
             else:
                 win32gui.ShowWindow(self.unity_hwnd, win32con.SW_HIDE)
 
-
     def resize_exe(self):
         if self.unity_hwnd and self.exe_container.isVisible():
-            # Получаем реальный размер, который PyQt выделил под виджет
             rect = self.exe_container.geometry()
             w, h = rect.width(), rect.height()
-
-            # Коэффициент "перекрытия".
-            # Если полоски по 5% с каждой стороны, увеличиваем ширину на 10%
-            # Попробуй менять эти значения, пока полоски не уйдут
             zoom_factor = 1.05
-
             new_w = int(w * zoom_factor)
             new_h = int(h * zoom_factor)
-
-            # Центрируем увеличенное окно Unity относительно контейнера
             off_x = (new_w - w) // 2
             off_y = (new_h - h) // 2
-
-            win32gui.SetWindowPos(
-                self.unity_hwnd,
-                win32con.HWND_TOP,
-                -off_x, -off_y,
-                new_w, new_h,
-                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED
-            )
-            # Отправляем сообщение о новом размере
+            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP, -off_x, -off_y, new_w, new_h, win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED)
             win32gui.SendMessage(self.unity_hwnd, win32con.WM_SIZE, 0, (new_h << 16) | new_w)
 
     def launch_exe(self):
@@ -361,44 +333,28 @@ class FlightControlApp(QMainWindow):
         t = os.getenv("MODEL_NAME", "My project")
         p = os.path.join(os.getcwd(), "model", f"{t}.exe")
         if os.path.exists(p):
-            # Запускаем Unity с аргументами, запрещающими выбор разрешения и фиксированный Aspect Ratio
-            # -screen-fullscreen 0 (в окне)
-            # -parentHWND ... (можно пробовать передать сразу, но мы делаем через SetParent)
             subprocess.Popen([p, "-screen-fullscreen", "0"], cwd=os.path.dirname(p))
-
             for _ in range(40):
                 QApplication.processEvents()
                 h = win32gui.FindWindow(None, t) or win32gui.FindWindow("UnityWndClass", None)
                 if h:
                     self.unity_hwnd = h
                     win32gui.SetParent(h, int(self.exe_container.winId()))
-
-                    # Убираем рамки окна Unity
                     style = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
                     win32gui.SetWindowLong(h, win32con.GWL_STYLE, style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
-
-                    # Вызываем resize сразу после захвата
                     self.resize_exe()
                     break
                 time.sleep(0.5)
 
     def resizeEvent(self, e): super().resizeEvent(e); QTimer.singleShot(50, self.resize_exe)
     def closeEvent(self, e):
-        """Вызывается при закрытии окна"""
         print("Завершение работы системы...")
-
-        # Останавливаем сетевой мост
         if hasattr(self, 'udp'):
             self.udp.stop()
-            self.udp.wait() # Ждем завершения потока
-
-        # Убиваем процесс Unity
+            self.udp.wait()
         try:
-            # /F - принудительно, /T - со всеми дочерними (handler), /IM - по имени
             os.system(f'taskkill /F /IM "My project.exe" /T')
-        except:
-            pass
-
+        except: pass
         e.accept()
 
 if __name__ == "__main__":
