@@ -38,7 +38,15 @@ class UDPBridge(QThread):
                 data, _ = in_sock.recvfrom(1024)
                 parts = [float(x) for x in data.decode('utf-8').strip().split(',')]
                 if len(parts) >= 6:
-                    out_sock.sendto(f"{parts[0]:.2f},{parts[1]:.2f},{parts[2]:.2f}".encode(), unity_addr)
+                    # В Unity скрипте: x = values[0], y = values[1], z = values[2]
+                    # Твой quat_to_euler возвращает: roll (0), pitch (1), yaw (2)
+
+                    pitch = parts[1]
+                    yaw = parts[2]
+                    roll = parts[0]
+
+                    # Отправляем в Unity в порядке X, Y, Z
+                    out_sock.sendto(f"{pitch:.2f},{yaw:.2f},{roll:.2f}".encode(), unity_addr)
                     self.data_received.emit(parts)
             except: continue
 
