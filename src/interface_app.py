@@ -319,33 +319,47 @@ class FlightControlApp(QMainWindow):
 
     def resize_exe(self):
         if self.unity_hwnd and self.exe_container.isVisible():
-            rect = self.exe_container.geometry()
+            # Получаем размеры контейнера PyQt
+            rect = self.exe_container.rect()
             w, h = rect.width(), rect.height()
-            zoom_factor = 1.05
-            new_w = int(w * zoom_factor)
-            new_h = int(h * zoom_factor)
-            off_x = (new_w - w) // 2
-            off_y = (new_h - h) // 2
-            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP, -off_x, -off_y, new_w, new_h, win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED)
-            win32gui.SendMessage(self.unity_hwnd, win32con.WM_SIZE, 0, (new_h << 16) | new_w)
 
+            # Принудительно сбрасываем стили (иногда они возвращаются)
+            style = win32gui.GetWindowLong(self.unity_hwnd, win32con.GWL_STYLE)
+            win32gui.SetWindowLong(self.unity_hwnd, win32con.GWL_STYLE,
+                                   style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
+
+            # Растягиваем окно Unity точно под размер контейнера (координаты 0,0)
+            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP,
+                                  0, 0, w, h,
+                                  win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
+
+            # Отправляем сообщение Unity, что размер изменился
+            win32gui.SendMessage(self.unity_hwnd, win32con.WM_SIZE, 0, (h << 16) | w)
     def launch_exe(self):
         load_dotenv()
         t = os.getenv("MODEL_NAME", "My project")
         p = os.path.join(os.getcwd(), "model", f"{t}.exe")
+
         if os.path.exists(p):
-            subprocess.Popen([p, "-screen-fullscreen", "0"], cwd=os.path.dirname(p))
-            for _ in range(40):
+            # Передаем ID контейнера прямо в аргументы запуска Unity
+            container_id = str(int(self.exe_container.winId()))
+            subprocess.Popen([p, "-parentHWND", container_id, "-screen-fullscreen", "0"],
+                             cwd=os.path.dirname(p))
+
+            for _ in range(60): # Увеличим время ожидания для тяжелых моделей
                 QApplication.processEvents()
-                h = win32gui.FindWindow(None, t) or win32gui.FindWindow("UnityWndClass", None)
+                h = win32gui.FindWindow(None, t)
                 if h:
                     self.unity_hwnd = h
-                    win32gui.SetParent(h, int(self.exe_container.winId()))
+                    # Убираем рамки
                     style = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
-                    win32gui.SetWindowLong(h, win32con.GWL_STYLE, style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
+                    win32gui.SetWindowLong(h, win32con.GWL_STYLE, style & ~win32con.WS_OVERLAPPEDWINDOW)
+                    win32gui.SetParent(h, int(self.exe_container.winId()))
+
                     self.resize_exe()
                     break
                 time.sleep(0.5)
+
 
     def resizeEvent(self, e): super().resizeEvent(e); QTimer.singleShot(50, self.resize_exe)
     def closeEvent(self, e):
