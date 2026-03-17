@@ -38,14 +38,9 @@ class UDPBridge(QThread):
                 data, _ = in_sock.recvfrom(1024)
                 parts = [float(x) for x in data.decode('utf-8').strip().split(',')]
                 if len(parts) >= 6:
-                    # В Unity скрипте: x = values[0], y = values[1], z = values[2]
-                    # Твой quat_to_euler возвращает: roll (0), pitch (1), yaw (2)
-
                     pitch = parts[1]
                     yaw = parts[2]
                     roll = parts[0]
-
-                    # Отправляем в Unity в порядке X, Y, Z
                     out_sock.sendto(f"{pitch:.2f},{yaw:.2f},{roll:.2f}".encode(), unity_addr)
                     self.data_received.emit(parts)
             except: continue
@@ -80,7 +75,8 @@ class FlightControlApp(QMainWindow):
 
         # Параметры цели
         self.target_x = 16000
-        self.start_deviation = 100.0 # Начальное отклонение для отрисовки прямой
+        self.start_time = time.time() # Фиксируем время старта для прогресса
+        self.start_deviation = 100.0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -241,81 +237,136 @@ class FlightControlApp(QMainWindow):
         v.addWidget(QLabel(title)); v.addWidget(val)
         w.val_label = val
         return w
+    def calculate_horizontal_dist(self, lat, lon):
+        if not hasattr(self, 'home_lat'):
+            if lat != 0 and lon != 0:
+                self.home_lat, self.home_lon = lat, lon
+            return 0.0
 
+        # 1 градус широты ~ 111139 метров
+        dx = (lat - self.home_lat) * 111139.0
+        # Длина градуса долготы зависит от широты
+        dy = (lon - self.home_lon) * 111139.0 * math.cos(math.radians(lat))
+
+        return math.sqrt(dx**2 + dy**2)
     def update_all(self):
         d = self.last_raw_data
-        if len(d) < 6: return
-        r, p, y, lat, lon, alt = d[0:6]
-        t_now = time.time()
-        dt = t_now - self.last_update_t
+        if not d: return
 
-        if dt > 0.5: dt = 0.033
-        self.last_update_t = t_now
+        # 1. Извлекаем данные
+        # d[0,1,2] - RPY, d[3,4] - GPS, d[5] - Alt, d[6] - Rudder
+        r, p, y = d[0], d[1], d[2]
+        lat, lon, alt = d[3], d[4], d[5]
 
-        if alt > 1.0:
-            self.is_flying = True
-            self.virtual_dist += 150.0 * dt
-        if alt < 0.5 and self.is_flying:
-            self.traj_x, self.traj_y, self.r_buf = [], [], []
-            self.virtual_dist = 0.0
-            self.is_flying = False
+        # 2. Обновляем Mission (Roll/Pitch/Yaw) — работает ВСЕГДА
+        self.refresh_mission_charts(r, p, y)
 
-        if self.is_flying or alt > 0.5:
-            self.traj_x.append(self.virtual_dist)
+        # 3. Честный расчет траектории (метры от старта)
+        dist = self.calculate_horizontal_dist(lat, lon)
+
+        # Добавляем точку, только если есть реальные данные (не нули)
+        if lat != 0 and lon != 0:
+            self.traj_x.append(dist)
             self.traj_y.append(alt)
-            if len(d) >= 7:
-                if not hasattr(self, 'r_buf'): self.r_buf = []
-                self.r_buf.append(d[6])
+            # Ограничиваем историю для производительности
+            if len(self.traj_x) > 5000:
+                self.traj_x.pop(0)
+                self.traj_y.pop(0)
 
-        # Всегда наполняем буферы графиков Mission
-        for i, key in enumerate(['r', 'p', 'y']):
-            self.buffer[key] = np.roll(self.buffer[key], -1)
-            self.buffer[key][-1] = d[i]
+        # 4. Обновляем данные симуляции (синусоиды)
+        self.update_simulated_data()
 
-        # ПРАВКА: Постоянно обновляем списки данных для графиков на вкладке Real-Time
-        self.speed_data.append(120 + 10 * math.sin(t_now * 0.5))
-        self.accel_data.append(2 * math.sin(t_now * 0.3))
-        self.alt_history.append(alt)
-        # Ограничиваем длину списков, чтобы не забивать память
-        self.speed_data = self.speed_data[-150:]
-        self.accel_data = self.accel_data[-150:]
-        self.alt_history = self.alt_history[-150:]
+        # 5. Отрисовка активной вкладки
+        idx = self.tabs.currentIndex()
+        if idx == 1:
+            self.draw_realtime_trajectory()
+        elif idx == 2:
+            self.draw_analyze_trajectory(d[6] if len(d) > 6 else 0.0)
 
-        # Текстовые данные обновляем всегда
+        # 6. Обновление текста (тот самый метод)
+        self.update_labels(lat, lon, alt)
+    def update_labels(self, lat, lon, alt):
+        """Обновление текстовых индикаторов координат и высоты"""
         self.rt_lat.val_label.setText(f"{lat:.7f}")
         self.rt_lon.val_label.setText(f"{lon:.7f}")
-        self.rt_alt.val_label.setText(f"{alt:.1f} m")
+        self.rt_alt.val_label.setText(f"{alt:.2f} m")
 
-        idx = self.tabs.currentIndex()
-        if idx == 0:
-            self.curve_r.setData(self.buffer['r'])
-            self.curve_p.setData(self.buffer['p'])
-            self.curve_y.setData(self.buffer['y'])
+    def update_simulated_data(self):
+        """Расчет синусоид скорости и ускорения (по ТЗ)"""
+        t = time.time()
+        self.speed_data.append(120 + 15 * math.sin(t * 0.5))
+        self.accel_data.append(2 + 0.5 * math.cos(t * 0.8))
 
-        elif idx == 1:
-            self.curve_raw.setData(self.traj_x, self.traj_y)
-            # Теперь здесь только отрисовка уже подготовленных в фоне данных
-            self.curve_speed.setData(self.speed_data)
-            self.curve_accel.setData(self.accel_data)
-            self.curve_alt_plot.setData(self.alt_history)
-            self.ind_bat.val_label.setText(f"{int(self.battery)}%")
-            self.ind_rssi.val_label.setText("85")
+        # Держим размер буфера
+        self.speed_data = self.speed_data[-self.max_pts:]
+        self.accel_data = self.accel_data[-self.max_pts:]
 
-        elif idx == 2:
-            if len(self.traj_y) > 0:
-                self.curve_an_traj.setData(self.traj_x, self.traj_y)
-                self.curve_corr_zoom.setData(self.traj_x[-100:], self.traj_y[-100:])
-                if hasattr(self, 'r_buf') and self.r_buf:
-                    self.curve_rudders.setData(self.r_buf[-150:])
-                    self.curve_rudders_zoom.setData(self.r_buf[-50:])
-                curr_x = self.traj_x[-1]
-                if curr_x < self.target_x:
-                    ratio = (self.target_x - curr_x) / self.target_x
-                    curr_dev = self.start_deviation * ratio
-                else:
-                    curr_dev = 0
-                self.curve_precision.setData([0, curr_x], [self.start_deviation, curr_dev])
-                if alt < 1.0: self.target_dot_main.setData([curr_x], [0])
+    def refresh_mission_charts(self, r, p, y):
+        """Графики на первой вкладке, которые нельзя прерывать"""
+        for key, val in zip(['r', 'p', 'y'], [r, p, y]):
+            self.buffer[key] = np.roll(self.buffer[key], -1)
+            self.buffer[key][-1] = val
+
+        self.curve_r.setData(self.buffer['r'])
+        self.curve_p.setData(self.buffer['p'])
+        self.curve_y.setData(self.buffer['y'])
+
+    def draw_realtime_trajectory(self):
+        """Вкладка Real-Time Data: профиль полета + синусоиды"""
+        # Траектория: X - метры, Y - высота
+        self.curve_raw.setData(self.traj_x, self.traj_y)
+
+        # Синусоиды (имитация скорости/ускорения для ТЗ)
+        t = time.time()
+        self.speed_data.append(120 + 15 * math.sin(t * 0.5))
+        self.accel_data.append(2 + 0.5 * math.cos(t * 0.8))
+        self.curve_speed.setData(self.speed_data[-self.max_pts:])
+        self.curve_accel.setData(self.accel_data[-self.max_pts:])
+
+    def draw_analyze_trajectory(self, rudder_val):
+        """Вкладка Analyze: прямая линия под углом к цели"""
+        # 1. Основной график и зум траектории (реальные данные)
+        self.curve_an_traj.setData(self.traj_x, self.traj_y)
+        if len(self.traj_x) > 0:
+            self.curve_corr_zoom.setData(self.traj_x[-100:], self.traj_y[-100:])
+
+        # 2. Работа рулей (дублируем на оба графика)
+        self.r_buf.append(rudder_val)
+        self.r_buf = self.r_buf[-self.max_pts:]
+        self.curve_rudders.setData(self.r_buf)
+        self.curve_rudders_zoom.setData(self.r_buf)
+
+        # 3. ЛОГИКА ДОСТИЖЕНИЯ ЦЕЛИ (Синяя линия под углом)
+        # Параметры: 10 минут (600 сек), цель на 16000м, старт на высоте 100м
+        elapsed = time.time() - self.start_time
+        duration = 600.0
+        start_alt = 100.0
+
+        # Текущий прогресс (от 0.0 до 1.0)
+        progress = min(elapsed / duration, 1.0)
+
+        # Текущие координаты "носа" синей линии
+        current_x = progress * self.target_x
+        current_y = start_alt * (1 - progress) # Снижение со 100 до 0
+
+        # Рисуем прямую линию от точки старта (0, 100) до текущей позиции
+        line_x = [0, current_x]
+        line_y = [start_alt, current_y]
+
+        self.curve_precision.setData(line_x, line_y)
+
+        # (Опционально) Если хочешь, чтобы точка текущего положения тоже двигалась:
+        # self.precision_dot_dynamic.setData([current_x], [current_y])
+
+    def update_simulated_plots(self):
+        """Метод для синусоид Speed/Accel по твоему ТЗ"""
+        t = time.time()
+        self.speed_data.append(120 + 15 * math.sin(t * 0.5))
+        self.accel_data.append(2 + 0.5 * math.cos(t * 0.8))
+        self.speed_data = self.speed_data[-self.max_pts:]
+        self.accel_data = self.accel_data[-self.max_pts:]
+        self.curve_speed.setData(self.speed_data)
+        self.curve_accel.setData(self.accel_data)
 
     def on_tab_changed(self, i):
         if self.unity_hwnd:
@@ -327,57 +378,33 @@ class FlightControlApp(QMainWindow):
 
     def resize_exe(self):
         if self.unity_hwnd and self.exe_container.isVisible():
-            # Получаем размеры контейнера PyQt
             rect = self.exe_container.rect()
             w, h = rect.width(), rect.height()
-
-            # Принудительно сбрасываем стили (иногда они возвращаются)
-            style = win32gui.GetWindowLong(self.unity_hwnd, win32con.GWL_STYLE)
-            win32gui.SetWindowLong(self.unity_hwnd, win32con.GWL_STYLE,
-                                   style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME)
-
-            # Растягиваем окно Unity точно под размер контейнера (координаты 0,0)
-            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP,
-                                  0, 0, w, h,
+            win32gui.SetWindowPos(self.unity_hwnd, win32con.HWND_TOP, 0, 0, w, h,
                                   win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW)
 
-            # Отправляем сообщение Unity, что размер изменился
-            win32gui.SendMessage(self.unity_hwnd, win32con.WM_SIZE, 0, (h << 16) | w)
     def launch_exe(self):
         load_dotenv()
         t = os.getenv("MODEL_NAME", "My project")
         p = os.path.join(os.getcwd(), "model", f"{t}.exe")
-
         if os.path.exists(p):
-            # Передаем ID контейнера прямо в аргументы запуска Unity
-            container_id = str(int(self.exe_container.winId()))
-            subprocess.Popen([p, "-parentHWND", container_id, "-screen-fullscreen", "0"],
+            subprocess.Popen([p, "-parentHWND", str(int(self.exe_container.winId())), "-screen-fullscreen", "0"],
                              cwd=os.path.dirname(p))
-
-            for _ in range(60): # Увеличим время ожидания для тяжелых моделей
+            for _ in range(60):
                 QApplication.processEvents()
                 h = win32gui.FindWindow(None, t)
                 if h:
                     self.unity_hwnd = h
-                    # Убираем рамки
                     style = win32gui.GetWindowLong(h, win32con.GWL_STYLE)
                     win32gui.SetWindowLong(h, win32con.GWL_STYLE, style & ~win32con.WS_OVERLAPPEDWINDOW)
                     win32gui.SetParent(h, int(self.exe_container.winId()))
-
-                    self.resize_exe()
-                    break
+                    self.resize_exe(); break
                 time.sleep(0.5)
-
 
     def resizeEvent(self, e): super().resizeEvent(e); QTimer.singleShot(50, self.resize_exe)
     def closeEvent(self, e):
-        print("Завершение работы системы...")
-        if hasattr(self, 'udp'):
-            self.udp.stop()
-            self.udp.wait()
-        try:
-            os.system(f'taskkill /F /IM "My project.exe" /T')
-        except: pass
+        if hasattr(self, 'udp'): self.udp.stop(); self.udp.wait()
+        os.system(f'taskkill /F /IM "My project.exe" /T')
         e.accept()
 
 if __name__ == "__main__":

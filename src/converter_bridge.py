@@ -57,7 +57,6 @@ def run_converter(port_name):
                     s1, s2, s3, s4 = data.get('servos', [0, 0, 0, 0])
 
                     ui_payload = f"{r:.2f},{p:.2f},{y:.2f},{lat:.7f},{lon:.7f},{alt:.2f},{s1:.1f},{s2:.1f},{s3:.1f},{s4:.1f}"
-                    print(f"Parsed: {ui_payload}")
                     sock.sendto(ui_payload.encode(), UI_ADDR)
         except Exception as e:
             print(f"Ошибка в цикле конвертера: {e}")
