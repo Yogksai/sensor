@@ -100,7 +100,7 @@ class LauncherWindow(QDialog):
         defaults = {
             "UNITY_PORT": "5005",
             "UI_PORT": "5006",
-            "MODEL_NAME": "Myproject"
+            "MODEL_NAME": "My project"
         }
 
         # Проверка и сохранение

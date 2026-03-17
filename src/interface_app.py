@@ -312,16 +312,19 @@ class FlightControlApp(QMainWindow):
         self.curve_y.setData(self.buffer['y'])
 
     def draw_realtime_trajectory(self):
-        """Вкладка Real-Time Data: профиль полета + синусоиды"""
-        # Траектория: X - метры, Y - высота
+        """Вкладка Real-Time Data: профиль полета + синусоиды + высота"""
+        # 1. Основной график траектории (X - метры, Y - высота)
         self.curve_raw.setData(self.traj_x, self.traj_y)
 
-        # Синусоиды (имитация скорости/ускорения для ТЗ)
-        t = time.time()
-        self.speed_data.append(120 + 15 * math.sin(t * 0.5))
-        self.accel_data.append(2 + 0.5 * math.cos(t * 0.8))
-        self.curve_speed.setData(self.speed_data[-self.max_pts:])
-        self.curve_accel.setData(self.accel_data[-self.max_pts:])
+        # 2. Синусоиды (Скорость и Ускорение)
+        self.curve_speed.setData(self.speed_data)
+        self.curve_accel.setData(self.accel_data)
+
+        # 3. ГРАФИК ВЫСОТЫ (Altitude Plot) — ВОТ ЭТОГО НЕ ХВАТАЛО
+        # Берем последние 150 точек (self.max_pts) из истории высоты
+        if len(self.traj_y) > 0:
+            display_alt = self.traj_y[-self.max_pts:]
+            self.curve_alt_plot.setData(display_alt)
 
     def draw_analyze_trajectory(self, rudder_val):
         """Вкладка Analyze: прямая линия под углом к цели"""
